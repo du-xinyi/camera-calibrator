@@ -19,6 +19,7 @@
 #include <limits>
 #include <locale>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -92,12 +93,42 @@ namespace
 
     cv::String cameraModelName(CameraModel cameraModel)
     {
-        return cameraModel == CameraModel::Fisheye ? "fisheye" : "pinhole";
+        switch (cameraModel)
+        {
+            case CameraModel::Pinhole: return "pinhole";
+            case CameraModel::Fisheye: return "fisheye";
+        }
+        return "unknown";
     }
 
     QString cameraModelDisplayName(CameraModel cameraModel)
     {
-        return cameraModel == CameraModel::Fisheye ? QStringLiteral("Fisheye") : QStringLiteral("Pinhole");
+        switch (cameraModel)
+        {
+            case CameraModel::Pinhole: return QStringLiteral("Pinhole");
+            case CameraModel::Fisheye: return QStringLiteral("Fisheye");
+        }
+        return QStringLiteral("Unknown");
+    }
+
+    int maximumRadialCoefficients(CameraModel model)
+    {
+        switch (model)
+        {
+            case CameraModel::Pinhole: return 3;
+            case CameraModel::Fisheye: return 4;
+        }
+        return 0;
+    }
+
+    size_t distortionCoefficientCount(CameraModel model)
+    {
+        switch (model)
+        {
+            case CameraModel::Pinhole: return 5U;
+            case CameraModel::Fisheye: return 4U;
+        }
+        return 0U;
     }
 
     cv::String dictionaryName(ArucoDictionary dictionary)
@@ -126,26 +157,13 @@ namespace
                     .arg(QString::fromLatin1(dictionaryName(opts.dictionary).c_str()));
         }
         return opts.method == CalibrationMethod::Classic ?
-                QStringLiteral("Chessboard / Classic") :
-                QStringLiteral("Chessboard / Sector-Based");
+                QObject::tr("Chessboard / 传统方法") :
+                QObject::tr("Chessboard / 扇区法");
     }
 
     bool parseCameraMatrix(const cv::FileNode &node, cv::Mat &matrix)
     {
-        if (node.empty())
-        {
-            return false;
-        }
-        if (!node.isSeq())
-        {
-            // OpenCV matrix 节点可直接反序列化；普通 YAML 序列由下方分支处理
-            node >> matrix;
-            matrix.convertTo(matrix, CV_64F);
-            return matrix.rows == 3 && matrix.cols == 3
-                    && matrix.channels() == 1;
-        }
-
-        if (node.size() != 3)
+        if (!node.isSeq() || node.size() != 3)
         {
             return false;
         }
@@ -159,21 +177,26 @@ namespace
             }
             for (int col = 0; col < 3; ++col)
             {
-                values[static_cast<size_t>(col)]
-                        >> matrix.at<double>(row, col);
+                const cv::FileNode value = values[static_cast<size_t>(col)];
+                if (!value.isInt() && !value.isReal())
+                {
+                    return false;
+                }
+                value >> matrix.at<double>(row, col);
             }
         }
         return true;
     }
 
     template<typename T>
-    void readIfPresent(const cv::FileStorage &storage, const char *key, T &value)
+    void readRequired(const cv::FileStorage &storage, const char *key, T &value)
     {
         const cv::FileNode node = storage[key];
-        if (!node.empty())
+        if (node.empty())
         {
-            node >> value;
+            throw std::invalid_argument(std::string("缺少必需参数：") + key);
         }
+        node >> value;
     }
 
     ArucoDictionary parseDictionaryName(const cv::String &name)
@@ -194,7 +217,11 @@ namespace
         {
             return ArucoDictionary::Original;
         }
-        return ArucoDictionary::Dict5x5_100;
+        if (name == "DICT_5X5_100")
+        {
+            return ArucoDictionary::Dict5x5_100;
+        }
+        throw std::invalid_argument("未知的 aruco_dictionary。");
     }
 
     cv::String detectionMethodName(CalibrationMethod method)
@@ -204,11 +231,16 @@ namespace
 
     QString validateOptions(const CalibrationOptions &opts)
     {
+        if (maximumRadialCoefficients(opts.cameraModel) == 0
+            || opts.radialCoeffs < 2 || opts.radialCoeffs > maximumRadialCoefficients(opts.cameraModel))
+        {
+            return QObject::tr("相机模型或径向系数数量无效。");
+        }
         if (opts.boardSize.width() < 2 || opts.boardSize.height() < 2)
         {
             return QObject::tr("标定板每个方向至少需要 2 个方格。");
         }
-        if (!(opts.squareSize > 0.0))
+        if (!std::isfinite(opts.squareSize) || !(opts.squareSize > 0.0))
         {
             return QObject::tr("方格尺寸必须大于 0。");
         }
@@ -382,6 +414,38 @@ namespace
                 detectChessboard(gray, opts);
     }
 
+    ImageDetectionReport detectionReport(const QString &path, const BoardDetection &detection,
+        const QSize &actualSize)
+    {
+        ImageDetectionReport report;
+        report.imagePath = path;
+        report.actualSize = actualSize;
+        report.cornersFound = static_cast<int>(detection.imagePoints.size());
+        if (detection.usable)
+        {
+            report.status = ImageDetectionStatus::Success;
+            report.message = QObject::tr("检测成功，共 %1 个有效角点。").arg(report.cornersFound);
+        }
+        else if (!detection.imagePoints.empty())
+        {
+            report.status = ImageDetectionStatus::InsufficientCorners;
+            report.message = QObject::tr("检测到 %1 个角点，但数量或几何分布不足以用于标定。")
+                    .arg(report.cornersFound);
+        }
+        else
+        {
+            report.status = ImageDetectionStatus::BoardNotFound;
+            report.message = QObject::tr("未检测到标定板角点，请检查图片与标定板配置。");
+        }
+        return report;
+    }
+
+    QString sizeMismatchMessage(const QSize &actual, const QSize &expected)
+    {
+        return QObject::tr("图片分辨率 %1×%2 与本次标定分辨率 %3×%4 不一致。")
+                .arg(actual.width()).arg(actual.height()).arg(expected.width()).arg(expected.height());
+    }
+
     void drawDetection(cv::Mat &image, const CalibrationOptions &opts,
         const BoardDetection &detection)
     {
@@ -440,16 +504,17 @@ namespace
         const std::vector<cv::Point2f> &imagePoints,
         const cv::Mat &rotationVector, const cv::Mat &translationVector,
         const cv::Mat &cameraMatrix, const cv::Mat &distCoeffs,
-        CameraModel cameraModel)
+        CameraModel cameraModel, std::vector<cv::Point2f> &projectedPoints)
     {
-        std::vector<cv::Point2f> projectedPoints;
+        projectedPoints.clear();
         // 单图误差必须用求解时的同一投影模型重新计算
         if (cameraModel == CameraModel::Fisheye)
         {
             cv::fisheye::projectPoints(
                 objectPoints, projectedPoints,
                 rotationVector, translationVector,
-                cameraMatrix, distCoeffs, 0.0);
+                cameraMatrix, distCoeffs,
+                cameraMatrix.at<double>(0, 1) / cameraMatrix.at<double>(0, 0));
         }
         else
         {
@@ -514,11 +579,32 @@ namespace
     }
 }
 
+QString imageDetectionStatusText(ImageDetectionStatus status)
+{
+    switch (status)
+    {
+        case ImageDetectionStatus::NotProcessed: return QObject::tr("未处理");
+        case ImageDetectionStatus::Success: return QObject::tr("检测成功");
+        case ImageDetectionStatus::ReadFailed: return QObject::tr("读取失败");
+        case ImageDetectionStatus::SizeMismatch: return QObject::tr("尺寸不一致");
+        case ImageDetectionStatus::BoardNotFound: return QObject::tr("未找到标定板");
+        case ImageDetectionStatus::InsufficientCorners: return QObject::tr("有效角点不足");
+        case ImageDetectionStatus::ProcessingFailed: return QObject::tr("处理失败");
+    }
+    return QObject::tr("未知状态");
+}
+
 QImage Calibrator::previewImage(const QString &filePath,
     const CalibrationOptions &opts,
     const CalibrationResult &calib,
-    bool showUndistorted, bool *found)
+    bool showUndistorted, bool *found, ImageDetectionReport *report)
 {
+    ImageDetectionReport current;
+    current.imagePath = filePath;
+    if (report)
+    {
+        *report = current;
+    }
     if (found)
     {
         *found = false;
@@ -546,11 +632,29 @@ QImage Calibrator::previewImage(const QString &filePath,
             if (image.empty())
             {
                 previewCacheAnnotated_.release();
+                current.status = ImageDetectionStatus::ReadFailed;
+                current.message = QObject::tr("无法读取图片，文件可能缺失或不是可读取的图像。");
+                previewCacheReport_ = current;
+                if (report)
+                {
+                    *report = current;
+                }
                 return {};
             }
 
-            const BoardDetection detection =
-                    validateOptions(opts).isEmpty() ? detectBoard(image, opts) : BoardDetection{};
+            current.actualSize = {image.cols, image.rows};
+            const QString optionsError = validateOptions(opts);
+            BoardDetection detection;
+            if (optionsError.isEmpty())
+            {
+                detection = detectBoard(image, opts);
+                current = detectionReport(filePath, detection, current.actualSize);
+            }
+            else
+            {
+                current.status = ImageDetectionStatus::ProcessingFailed;
+                current.message = optionsError;
+            }
             drawDetection(image, opts, detection);
             previewCacheFilePath_ = filePath;
             previewCacheFileSize_ = fileInfo.size();
@@ -558,10 +662,37 @@ QImage Calibrator::previewImage(const QString &filePath,
             previewCacheOptions_ = opts;
             previewCacheAnnotated_ = std::move(image);
             previewCacheFound_ = detection.usable;
+            previewCacheReport_ = current;
+        }
+        current = previewCacheReport_;
+        if (calib.success && calib.imageSize.width() > 0 && calib.imageSize.height() > 0)
+        {
+            current.expectedSize = calib.imageSize;
+            if (current.actualSize != calib.imageSize)
+            {
+                current.status = ImageDetectionStatus::SizeMismatch;
+                current.message = sizeMismatchMessage(current.actualSize, calib.imageSize);
+            }
+        }
+        else
+        {
+            for (const ImageDetectionReport &batchReport: calib.imageReports)
+            {
+                if (batchReport.imagePath == filePath && batchReport.status == ImageDetectionStatus::SizeMismatch
+                    && batchReport.actualSize == current.actualSize)
+                {
+                    current = batchReport;
+                    break;
+                }
+            }
+        }
+        if (report)
+        {
+            *report = current;
         }
         if (found)
         {
-            *found = previewCacheFound_;
+            *found = previewCacheFound_ && current.status == ImageDetectionStatus::Success;
         }
 
         cv::Mat display = previewCacheAnnotated_;
@@ -588,14 +719,95 @@ QImage Calibrator::previewImage(const QString &filePath,
 
         return matToQImage(display);
     }
-    catch (const cv::Exception &)
+    catch (const cv::Exception &exception)
     {
-        return {};
+        current.status = ImageDetectionStatus::ProcessingFailed;
+        current.message = QObject::tr("OpenCV 处理失败：%1").arg(QString::fromLocal8Bit(exception.what()));
     }
-    catch (const std::exception &)
+    catch (const std::exception &exception)
     {
-        return {};
+        current.status = ImageDetectionStatus::ProcessingFailed;
+        current.message = QObject::tr("图片处理失败：%1").arg(QString::fromLocal8Bit(exception.what()));
     }
+    previewCacheAnnotated_.release();
+    previewCacheFound_ = false;
+    previewCacheReport_ = current;
+    if (found)
+    {
+        *found = false;
+    }
+    if (report)
+    {
+        *report = current;
+    }
+    return {};
+}
+
+UndistortionPreview Calibrator::undistortionPreview(const QString &filePath,
+    const CalibrationResult &result) const
+{
+    UndistortionPreview preview;
+    try
+    {
+        const cv::Mat input = cv::imread(filePath.toStdString(), cv::IMREAD_COLOR);
+        if (input.empty())
+        {
+            preview.error = QObject::tr("无法读取输入图片。");
+            return preview;
+        }
+        preview.original = matToQImage(input);
+        const cv::Mat &matrix = result.cameraMatrix;
+        const cv::Mat &distortion = result.distCoeffs;
+        const bool knownModel = result.options.cameraModel == CameraModel::Pinhole
+                || result.options.cameraModel == CameraModel::Fisheye;
+        const size_t coefficients = distortionCoefficientCount(result.options.cameraModel);
+        if (!result.success || !knownModel || matrix.type() != CV_64FC1
+            || matrix.rows != 3 || matrix.cols != 3 || !cv::checkRange(matrix)
+            || matrix.at<double>(0, 0) <= 0.0 || matrix.at<double>(1, 1) <= 0.0
+            || matrix.at<double>(2, 0) != 0.0 || matrix.at<double>(2, 1) != 0.0
+            || matrix.at<double>(2, 2) != 1.0 || distortion.type() != CV_64FC1
+            || (distortion.rows != 1 && distortion.cols != 1)
+            || distortion.total() != coefficients || !cv::checkRange(distortion)
+            || result.imageSize.width() <= 0 || result.imageSize.height() <= 0)
+        {
+            preview.error = QObject::tr("没有可用的有效标定参数。");
+            return preview;
+        }
+        if (result.imageSize != QSize(input.cols, input.rows))
+        {
+            preview.error = QObject::tr("图片分辨率 %1×%2 与标定分辨率 %3×%4 不一致。")
+                    .arg(input.cols).arg(input.rows)
+                    .arg(result.imageSize.width()).arg(result.imageSize.height());
+            return preview;
+        }
+        cv::Mat output;
+        if (result.options.cameraModel == CameraModel::Fisheye)
+        {
+            cv::fisheye::undistortImage(input, output, matrix, distortion, matrix, input.size());
+        }
+        else
+        {
+            cv::undistort(input, output, matrix, distortion);
+        }
+        preview.undistorted = matToQImage(output);
+        if (preview.undistorted.isNull())
+        {
+            preview.error = QObject::tr("无法生成去畸变预览。");
+        }
+    }
+    catch (const cv::Exception &exception)
+    {
+        preview.undistorted = {};
+        preview.error = QObject::tr("OpenCV 错误：%1")
+                .arg(QString::fromLocal8Bit(exception.what()));
+    }
+    catch (const std::exception &exception)
+    {
+        preview.undistorted = {};
+        preview.error = QObject::tr("错误：%1")
+                .arg(QString::fromLocal8Bit(exception.what()));
+    }
+    return preview;
 }
 
 CalibrationResult Calibrator::calibrate(const QStringList &files,
@@ -636,41 +848,64 @@ CalibrationResult Calibrator::calibrate(const QStringList &files,
                 return result;
             }
 
-            const cv::Mat img =
-                    cv::imread(files[i].toStdString(), cv::IMREAD_COLOR);
-            bool detected = false;
-            if (!img.empty())
+            ImageDetectionReport imageReport;
+            imageReport.imagePath = files[i];
+            imageReport.expectedSize = imageSize.width > 0
+                    ? QSize(imageSize.width, imageSize.height) : QSize();
+            try
             {
-                // 一组内参只对应一个像素坐标尺度，尺寸不同的图片不能混入同次求解
-                if (imageSize.width == 0)
+                const cv::Mat img = cv::imread(files[i].toStdString(), cv::IMREAD_COLOR);
+                if (img.empty())
                 {
-                    imageSize = img.size();
+                    imageReport.status = ImageDetectionStatus::ReadFailed;
+                    imageReport.message = QObject::tr("无法读取图片，文件可能缺失或不是可读取的图像。");
                 }
-                else if (img.size() != imageSize)
+                else
                 {
-                    ++sizeMismatchCount;
-                    if (progress)
+                    imageReport.actualSize = {img.cols, img.rows};
+                    // 尺寸基准与原流程一致，使用本次首张可读取图片。
+                    if (imageSize.width == 0)
                     {
-                        progress(i + 1, total, false);
+                        imageSize = img.size();
                     }
-                    continue;
-                }
-
-                BoardDetection detection = detectBoard(img, opts);
-                if (detection.usable)
-                {
-                    objectPoints.push_back(
-                        std::move(detection.objectPoints));
-                    imagePoints.push_back(
-                        std::move(detection.imagePoints));
-                    usedFiles.push_back(files[i]);
-                    detected = true;
+                    imageReport.expectedSize = {imageSize.width, imageSize.height};
+                    if (img.size() != imageSize)
+                    {
+                        ++sizeMismatchCount;
+                        imageReport.status = ImageDetectionStatus::SizeMismatch;
+                        imageReport.message = sizeMismatchMessage(imageReport.actualSize, imageReport.expectedSize);
+                    }
+                    else
+                    {
+                        BoardDetection detection = detectBoard(img, opts);
+                        imageReport = detectionReport(files[i], detection, imageReport.actualSize);
+                        imageReport.expectedSize = {imageSize.width, imageSize.height};
+                        if (detection.usable)
+                        {
+                            objectPoints.push_back(std::move(detection.objectPoints));
+                            imagePoints.push_back(std::move(detection.imagePoints));
+                            usedFiles.push_back(files[i]);
+                        }
+                    }
                 }
             }
+            catch (const cv::Exception &exception)
+            {
+                imageReport.status = ImageDetectionStatus::ProcessingFailed;
+                imageReport.message = QObject::tr("OpenCV 处理失败：%1")
+                        .arg(QString::fromLocal8Bit(exception.what()));
+            }
+            catch (const std::exception &exception)
+            {
+                imageReport.status = ImageDetectionStatus::ProcessingFailed;
+                imageReport.message = QObject::tr("图片处理失败：%1")
+                        .arg(QString::fromLocal8Bit(exception.what()));
+            }
 
+            result.imageReports.push_back(std::move(imageReport));
             if (progress)
             {
-                progress(i + 1, total, detected);
+                progress(i + 1, total, result.imageReports.back());
             }
         }
 
@@ -726,7 +961,7 @@ CalibrationResult Calibrator::calibrate(const QStringList &files,
         }
         else
         {
-            distCoeffs = cv::Mat::zeros(8, 1, CV_64F);
+            distCoeffs = cv::Mat::zeros(5, 1, CV_64F);
             int flags = 0;
             if (!opts.tangential)
             {
@@ -743,6 +978,7 @@ CalibrationResult Calibrator::calibrate(const QStringList &files,
 
         const bool parametersValid =
                 std::isfinite(rms)
+                && distCoeffs.total() == distortionCoefficientCount(opts.cameraModel)
                 && cv::checkRange(cameraMatrix)
                 && cv::checkRange(distCoeffs)
                 && cameraMatrix.at<double>(0, 0) > 0.0
@@ -769,10 +1005,11 @@ CalibrationResult Calibrator::calibrate(const QStringList &files,
         result.poses.reserve(poseCount);
         for (size_t index = 0; index < poseCount; ++index)
         {
+            std::vector<cv::Point2f> projectedPoints;
             const double reprojectionError = viewReprojectionError(
                 objectPoints[index], imagePoints[index],
                 rvecs[index], tvecs[index], cameraMatrix, distCoeffs,
-                opts.cameraModel);
+                opts.cameraModel, projectedPoints);
             if (!std::isfinite(reprojectionError))
             {
                 result.success = false;
@@ -786,7 +1023,9 @@ CalibrationResult Calibrator::calibrate(const QStringList &files,
                     usedFiles[static_cast<qsizetype>(index)],
                     matToVec3d(rvecs[index]),
                     matToVec3d(tvecs[index]),
-                    reprojectionError
+                    reprojectionError,
+                    std::move(imagePoints[index]),
+                    std::move(projectedPoints)
                 });
         }
         result.report = formatReport(result, imageSize);
@@ -816,6 +1055,12 @@ CalibrationResult Calibrator::calibrate(const QStringList &files,
         {
             result.report += QObject::tr("\n注：%1 张图片因尺寸与首张不一致而被跳过。")
                     .arg(sizeMismatchCount);
+        }
+        if (isCanceled && isCanceled())
+        {
+            result.success = false;
+            result.report = QObject::tr("标定已取消，结果未完成。");
+            return result;
         }
     }
     catch (const cv::Exception &e)
@@ -859,19 +1104,23 @@ bool Calibrator::exportParameters(const QString &filePath,
         }
         return false;
     }
-    const size_t expectedDistortionCount =
-            result.options.cameraModel == CameraModel::Fisheye ? 4U : 5U;
-    if (result.distCoeffs.channels() != 1
+    const size_t expectedDistortionCount = distortionCoefficientCount(result.options.cameraModel);
+    if (expectedDistortionCount == 0U || result.distCoeffs.channels() != 1
         || result.distCoeffs.total() != expectedDistortionCount)
     {
         if (error)
         {
             *error = QObject::tr(
-                "畸变系数数量与相机模型不匹配：针孔模型需要 5 个，鱼眼模型需要 4 个。");
+                "畸变系数数量与相机模型不匹配：Pinhole 需要 5 个，Fisheye 需要 4 个。");
         }
         return false;
     }
-
+    if (result.options.radialCoeffs < 2
+        || result.options.radialCoeffs > maximumRadialCoefficients(result.options.cameraModel))
+    {
+        if (error) *error = QObject::tr("径向系数数量与相机模型不匹配。");
+        return false;
+    }
     try
     {
         // 先在内存中完成整个文档，随后通过 QSaveFile 一次性提交到目标路径
@@ -889,7 +1138,7 @@ bool Calibrator::exportParameters(const QString &filePath,
         }
 
         const CalibrationOptions &opts = result.options;
-        storage << "format_version" << 2;
+        storage << "format_version" << 3;
         storage << "camera_model" << cameraModelName(opts.cameraModel);
         storage << "image_width" << result.imageSize.width();
         storage << "image_height" << result.imageSize.height();
@@ -1064,11 +1313,29 @@ std::optional<CalibrationResult> Calibrator::importParameters(
             return std::nullopt;
         }
 
-        // 核心矩阵和分辨率是必需字段，其余元数据缺失时沿用结构体默认值
+        int version = 0;
+        readRequired(storage, "format_version", version);
+        if (version != 3)
+        {
+            if (error) *error = QObject::tr("仅支持 format_version 为 3 的参数文件。");
+            return std::nullopt;
+        }
         CalibrationResult result;
         cv::String cameraModel;
-        readIfPresent(storage, "camera_model", cameraModel);
-        result.options.cameraModel = cameraModel == "fisheye" ? CameraModel::Fisheye : CameraModel::Pinhole;
+        readRequired(storage, "camera_model", cameraModel);
+        if (cameraModel == "pinhole")
+        {
+            result.options.cameraModel = CameraModel::Pinhole;
+        }
+        else if (cameraModel == "fisheye")
+        {
+            result.options.cameraModel = CameraModel::Fisheye;
+        }
+        else
+        {
+            if (error) *error = QObject::tr("未知的 camera_model。");
+            return std::nullopt;
+        }
         if (!parseCameraMatrix(storage["camera_matrix"],
             result.cameraMatrix))
         {
@@ -1078,8 +1345,15 @@ std::optional<CalibrationResult> Calibrator::importParameters(
             }
             return std::nullopt;
         }
-        storage["distortion_coefficients"] >> result.distCoeffs;
-        if (result.distCoeffs.empty() || result.distCoeffs.channels() != 1)
+        const cv::FileNode distortion = storage["distortion_coefficients"];
+        if (!distortion.isMap())
+        {
+            if (error) *error = QObject::tr("distortion_coefficients 必须是 1×N OpenCV 矩阵。");
+            return std::nullopt;
+        }
+        distortion >> result.distCoeffs;
+        if (result.distCoeffs.empty() || result.distCoeffs.rows != 1
+            || result.distCoeffs.channels() != 1)
         {
             if (error)
             {
@@ -1087,17 +1361,18 @@ std::optional<CalibrationResult> Calibrator::importParameters(
             }
             return std::nullopt;
         }
-        result.distCoeffs = result.distCoeffs.reshape(1, 1);
         result.distCoeffs.convertTo(result.distCoeffs, CV_64F);
 
-        const size_t expectedCount =
-                result.options.cameraModel == CameraModel::Fisheye ? 4U : 5U;
+        const size_t expectedCount = distortionCoefficientCount(result.options.cameraModel);
         // 当前文件契约不接受与模型不匹配的可变长度畸变向量
         if (result.distCoeffs.total() != expectedCount
             || !cv::checkRange(result.cameraMatrix)
             || !cv::checkRange(result.distCoeffs)
             || result.cameraMatrix.at<double>(0, 0) <= 0.0
-            || result.cameraMatrix.at<double>(1, 1) <= 0.0)
+            || result.cameraMatrix.at<double>(1, 1) <= 0.0
+            || result.cameraMatrix.at<double>(2, 0) != 0.0
+            || result.cameraMatrix.at<double>(2, 1) != 0.0
+            || result.cameraMatrix.at<double>(2, 2) != 1.0)
         {
             if (error)
             {
@@ -1109,8 +1384,8 @@ std::optional<CalibrationResult> Calibrator::importParameters(
 
         int imageWidth = 0;
         int imageHeight = 0;
-        readIfPresent(storage, "image_width", imageWidth);
-        readIfPresent(storage, "image_height", imageHeight);
+        readRequired(storage, "image_width", imageWidth);
+        readRequired(storage, "image_height", imageHeight);
         if (imageWidth <= 0 || imageHeight <= 0)
         {
             if (error)
@@ -1122,30 +1397,36 @@ std::optional<CalibrationResult> Calibrator::importParameters(
         result.imageSize = {imageWidth, imageHeight};
 
         cv::String boardType;
-        readIfPresent(storage, "board_type", boardType);
-        result.options.boardType = boardType == "chess" ?
-                CalibrationBoardType::Chessboard :
-                CalibrationBoardType::Charuco;
-        int boardColumns = result.options.boardSize.width();
-        int boardRows = result.options.boardSize.height();
-        readIfPresent(storage, "board_columns", boardColumns);
-        readIfPresent(storage, "board_rows", boardRows);
-        if (boardColumns >= 2 && boardRows >= 2)
+        readRequired(storage, "board_type", boardType);
+        if (boardType != "chess" && boardType != "charuco")
         {
-            result.options.boardSize = {boardColumns, boardRows};
+            if (error) *error = QObject::tr("未知的 board_type。");
+            return std::nullopt;
         }
-        readIfPresent(storage, "square_size_mm", result.options.squareSize);
+        result.options.boardType = boardType == "chess" ?
+                CalibrationBoardType::Chessboard : CalibrationBoardType::Charuco;
+        int boardColumns = 0;
+        int boardRows = 0;
+        readRequired(storage, "board_columns", boardColumns);
+        readRequired(storage, "board_rows", boardRows);
+        result.options.boardSize = {boardColumns, boardRows};
+        readRequired(storage, "square_size_mm", result.options.squareSize);
         if (result.options.boardType == CalibrationBoardType::Charuco)
         {
-            readIfPresent(storage, "marker_size_mm", result.options.markerSize);
+            readRequired(storage, "marker_size_mm", result.options.markerSize);
             cv::String dictionary;
-            readIfPresent(storage, "aruco_dictionary", dictionary);
+            readRequired(storage, "aruco_dictionary", dictionary);
             result.options.dictionary = parseDictionaryName(dictionary);
         }
         else
         {
             cv::String method;
-            readIfPresent(storage, "corner_detection_method", method);
+            readRequired(storage, "corner_detection_method", method);
+            if (method != "findChessboardCorners" && method != "findChessboardCornersSB")
+            {
+                if (error) *error = QObject::tr("未知的 corner_detection_method。");
+                return std::nullopt;
+            }
             result.options.method = method == "findChessboardCornersSB" ?
                     CalibrationMethod::SectorBased :
                     CalibrationMethod::Classic;
@@ -1153,32 +1434,29 @@ std::optional<CalibrationResult> Calibrator::importParameters(
         int flag = 0;
         if (result.options.cameraModel == CameraModel::Fisheye)
         {
-            readIfPresent(storage, "estimate_skew", flag);
+            readRequired(storage, "estimate_skew", flag);
+            if (flag != 0 && flag != 1) throw std::invalid_argument("estimate_skew 必须为 0 或 1。");
             result.options.skew = flag != 0;
         }
         else
         {
-            flag = 1;
-            readIfPresent(storage, "estimate_tangential_distortion", flag);
+            readRequired(storage, "estimate_tangential_distortion", flag);
+            if (flag != 0 && flag != 1) throw std::invalid_argument("estimate_tangential_distortion 必须为 0 或 1。");
             result.options.tangential = flag != 0;
         }
-        result.options.radialCoeffs =
-                result.options.cameraModel == CameraModel::Fisheye ? 4 : 3;
-        readIfPresent(storage, "radial_coefficients",
+        readRequired(storage, "radial_coefficients",
             result.options.radialCoeffs);
-        readIfPresent(storage, "rms_reprojection_error", result.rmsError);
+        readRequired(storage, "rms_reprojection_error", result.rmsError);
         flag = 0;
-        readIfPresent(storage, "quality_warning", flag);
+        readRequired(storage, "quality_warning", flag);
+        if (flag != 0 && flag != 1) throw std::invalid_argument("quality_warning 必须为 0 或 1。");
         result.qualityWarning = flag != 0;
-        readIfPresent(storage, "images_used", result.imagesUsed);
-        readIfPresent(storage, "images_total", result.imagesTotal);
-        const int maximumRadial =
-                result.options.cameraModel == CameraModel::Fisheye ? 4 : 3;
-        if (result.options.radialCoeffs < 2
-            || result.options.radialCoeffs > maximumRadial
-            || !std::isfinite(result.options.squareSize)
-            || result.options.squareSize <= 0.0
-            || !std::isfinite(result.rmsError))
+        readRequired(storage, "images_used", result.imagesUsed);
+        readRequired(storage, "images_total", result.imagesTotal);
+        if (!validateOptions(result.options).isEmpty()
+            || !std::isfinite(result.rmsError) || result.rmsError < 0.0
+            || result.imagesUsed < 0 || result.imagesTotal < result.imagesUsed
+            || !storage["poses"].isSeq())
         {
             if (error)
             {
@@ -1225,7 +1503,13 @@ bool Calibrator::undistortImageFile(const QString &inputPath,
         error->clear();
     }
     if (!result.success || result.cameraMatrix.empty()
-        || result.distCoeffs.empty())
+        || result.distCoeffs.empty()
+        || distortionCoefficientCount(result.options.cameraModel) == 0U
+        || result.distCoeffs.total() != distortionCoefficientCount(result.options.cameraModel)
+        || result.distCoeffs.channels() != 1
+        || result.cameraMatrix.rows != 3 || result.cameraMatrix.cols != 3
+        || result.cameraMatrix.channels() != 1
+        || !cv::checkRange(result.cameraMatrix) || !cv::checkRange(result.distCoeffs))
     {
         if (error)
         {

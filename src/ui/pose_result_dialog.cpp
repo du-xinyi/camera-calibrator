@@ -1,4 +1,5 @@
 #include "pose_result_dialog.h"
+#include "theme.h"
 #include "ui_pose_result_dialog.h"
 
 #include <QAbstractItemView>
@@ -281,7 +282,7 @@ void PoseVisualizationWidget::rebuildGeometry()
         appendCamera(geometry_->lines, geometry_->labels,
             cv::Matx33d::eye(), {}, referenceSize * 0.08,
             QColor(45, 50, 60), 2.0,
-            QStringLiteral("Camera"));
+            tr("相机"));
         for (size_t index = 0; index < poseCount; ++index)
         {
             const CalibrationPose &pose = result_.poses[index];
@@ -301,7 +302,7 @@ void PoseVisualizationWidget::rebuildGeometry()
     appendBoard(geometry_->lines, geometry_->labels,
         cv::Matx33d::eye(), {}, boardWidth, boardHeight,
         QColor(45, 50, 60), 2.0,
-        QStringLiteral("camera-calibrator Board"));
+        tr("标定板"));
     for (size_t index = 0; index < poseCount; ++index)
     {
         const CalibrationPose &pose = result_.poses[index];
@@ -329,7 +330,7 @@ void PoseVisualizationWidget::paintEvent(QPaintEvent *event)
 
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
-    painter.fillRect(rect(), QColor(247, 249, 252));
+    painter.fillRect(rect(), Theme::kSurfaceAlt);
     painter.setPen(QPen(QColor(205, 211, 220), 1.0));
     painter.drawRect(rect().adjusted(0, 0, -1, -1));
 
@@ -406,8 +407,8 @@ void PoseVisualizationWidget::paintEvent(QPaintEvent *event)
         QRectF(12.0, 10.0, width() - 24.0, 24.0),
         Qt::AlignLeft | Qt::AlignVCenter,
         viewStyle_ == ViewStyle::CameraCentric ?
-        tr("Camera-Centric：固定相机，显示标定板姿态 · 拖动旋转 / 滚轮缩放") :
-        tr("Pattern-Centric：固定标定板，显示相机姿态 · 拖动旋转 / 滚轮缩放"));
+        tr("固定相机，显示标定板姿态 · 拖动旋转 / 滚轮缩放") :
+        tr("固定标定板，显示相机姿态 · 拖动旋转 / 滚轮缩放"));
 }
 
 void PoseVisualizationWidget::mousePressEvent(QMouseEvent *event)
@@ -473,6 +474,7 @@ PoseResultDialog::PoseResultDialog(const CalibrationResult &result,
       baselineRms_(result.rmsError)
 {
     ui_->setupUi(this);
+    Theme::repolish(this);
     ui_->poseVisualization->setCalibrationResult(result);
     ui_->summaryLabel->setText(
         tr("%1 个有效位姿 · RMS %2 px · 按单图 RMS 降序 · 红色 > %3 px")
@@ -576,7 +578,7 @@ void PoseResultDialog::populatePoseTable(const CalibrationResult &result)
         excludeItem->setData(kImagePathRole, pose.imagePath);
         excludeItem->setTextAlignment(Qt::AlignCenter);
         excludeItem->setToolTip(
-            tr("勾选后可从图片列表移除并重新标定"));
+            tr("勾选后可停用对应图片并重新标定，之后可在图片列表中重新启用"));
         ui_->poseTable->setItem(row, 0, excludeItem);
 
         auto *imageItem =
@@ -601,8 +603,8 @@ void PoseResultDialog::populatePoseTable(const CalibrationResult &result)
                  ++column)
             {
                 QTableWidgetItem *item = ui_->poseTable->item(row, column);
-                item->setBackground(QColor(255, 232, 232));
-                item->setForeground(QColor(150, 35, 35));
+                item->setBackground(Theme::kDangerBackground);
+                item->setForeground(Theme::kDanger);
             }
         }
     }
@@ -631,5 +633,5 @@ void PoseResultDialog::updateExcludeButton()
     excludeButton_->setText(
         checkedCount == 0 ? tr("排除所选并重新标定") : tr("排除所选并重新标定 (%1)").arg(checkedCount));
     excludeButton_->setToolTip(
-        remainingCount < 3 ? tr("至少保留 3 张有效图片") : tr("从图片列表移除勾选项，并立即重新标定"));
+        remainingCount < 3 ? tr("至少保留 3 张有效图片") : tr("停用勾选图片，并立即重新标定"));
 }

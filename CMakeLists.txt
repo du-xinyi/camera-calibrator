@@ -102,12 +102,24 @@ target_link_libraries(CalibrationCore PUBLIC Qt6::Gui ${OpenCV_LIBS})
 
 add_library(CalibrationUi STATIC
     src/ui/algorithm_comparison_dialog.cpp
+    src/ui/calibration_diagnostics_dialog.cpp
+    src/ui/image_comparison_dialog.cpp
     src/ui/mainwindow.cpp
     src/ui/mainwindow.ui
     src/ui/pose_result_dialog.cpp
     src/ui/pose_result_dialog.ui
+    src/ui/theme.cpp
 )
 target_include_directories(CalibrationUi PUBLIC src/ui)
+
+# 样式表与图标编译进程序，静态库的资源由 Qt 以对象库方式随链接传递
+file(GLOB _ui_icons RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/icons/*.svg")
+qt_add_resources(CalibrationUi "ui_resources"
+    PREFIX "/"
+    BASE resources
+    FILES resources/theme.qss ${_ui_icons}
+)
 target_link_libraries(CalibrationUi PUBLIC
     CalibrationCore
     Qt6::Widgets
@@ -126,3 +138,43 @@ set_target_properties(camera-calibrator PROPERTIES
     WIN32_EXECUTABLE OFF
     MACOSX_BUNDLE OFF
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(calibration-project-test tests/calibration_project_test.cpp)
+    target_link_libraries(calibration-project-test PRIVATE CalibrationCore)
+    add_test(NAME calibration-project COMMAND calibration-project-test)
+
+    add_executable(calibration-diagnostics-test tests/calibration_diagnostics_test.cpp)
+    target_link_libraries(calibration-diagnostics-test PRIVATE CalibrationCore)
+    add_test(NAME calibration-diagnostics COMMAND calibration-diagnostics-test)
+    set_tests_properties(calibration-diagnostics PROPERTIES TIMEOUT 60)
+
+    add_executable(ui-features-test tests/ui_features_test.cpp)
+    target_link_libraries(ui-features-test PRIVATE CalibrationUi)
+    add_test(NAME ui-features COMMAND ui-features-test)
+    set_tests_properties(ui-features PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        TIMEOUT 30
+    )
+
+    add_executable(unsaved-changes-test tests/unsaved_changes_test.cpp)
+    target_link_libraries(unsaved-changes-test PRIVATE CalibrationUi)
+    add_test(NAME unsaved-changes COMMAND unsaved-changes-test)
+    set_tests_properties(unsaved-changes PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        TIMEOUT 30
+    )
+
+    add_executable(image-comparison-test tests/image_comparison_test.cpp)
+    target_link_libraries(image-comparison-test PRIVATE CalibrationUi)
+    add_test(NAME image-comparison COMMAND image-comparison-test)
+
+    add_executable(diagnostics-ui-test tests/diagnostics_ui_test.cpp)
+    target_link_libraries(diagnostics-ui-test PRIVATE CalibrationUi)
+    add_test(NAME diagnostics-ui COMMAND diagnostics-ui-test)
+    set_tests_properties(image-comparison diagnostics-ui PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        TIMEOUT 30
+    )
+endif()

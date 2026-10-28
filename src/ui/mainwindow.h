@@ -16,10 +16,12 @@
 
 class QAction;
 class QCheckBox;
+class QCloseEvent;
 class QComboBox;
 class QDoubleSpinBox;
 class QLabel;
 class QListWidget;
+class QListWidgetItem;
 class QProgressDialog;
 class QScrollArea;
 class QSpinBox;
@@ -57,7 +59,7 @@ public:
     /**
      * @brief 将一组图片加入当前标定项目
      *
-     * @details 载入过程会过滤重复路径和不可解码文件，并为每张图片生成缩略图与质量预检结果
+     * @details 载入过程过滤重复路径，为可读图片生成缩略图和质量提示，并保留读取失败的占位项
      *
      * @param files 待加入的图片路径
      */
@@ -71,6 +73,8 @@ protected:
      * @param event Qt 窗口缩放事件
      */
     void resizeEvent(QResizeEvent *event) override;
+
+    void closeEvent(QCloseEvent *event) override;
 
 private
 
@@ -86,6 +90,8 @@ private
 
     void onSaveProject();
 
+    void onSaveProjectAs();
+
     void onImportParameters();
 
     void onCalibrate();
@@ -94,6 +100,10 @@ private
 
     void onShowPoses();
 
+    void onShowDiagnostics();
+
+    void onShowUndistortionComparison();
+
     void onExportParameters();
 
     void onExportUndistortedImages();
@@ -101,6 +111,10 @@ private
     void onClearAll();
 
     void onImageSelectionChanged();
+
+    void onImageParticipationChanged(QListWidgetItem *item);
+
+    void onApplyComparisonResult(const CalibrationResult &result);
 
     void onCameraModelChanged();
 
@@ -124,6 +138,11 @@ private:
     void buildStatusBar();
 
     void updateUiState();
+
+    /**
+     * @brief 按当前标定结果刷新右侧结果卡片与状态栏 RMS
+     */
+    void updateResultSummary();
 
     void invalidateCalibrationResult();
 
@@ -151,12 +170,27 @@ private:
 
     CalibrationOptions currentOptions() const;
 
-    QStringList collectFiles() const;
+    QStringList collectFiles(bool enabledOnly = true) const;
+
+    void setImageParticipation(const QStringList &paths, bool enabled);
+
+    void refreshImageFilter();
+
+    void updateImageReport(const ImageDetectionReport &report);
+
+    bool saveProject(bool saveAs = false);
+
+    bool confirmDiscardChanges();
+
+    void markProjectModified();
+
+    void setProjectModified(bool modified);
 
     std::unique_ptr<Ui::MainWindow> ui_;
 
     // === 由 Qt 对象树管理的图片视图 ===
     QListWidget *imageList_ = nullptr;
+    QComboBox *imageFilterCombo_ = nullptr;
     QScrollArea *imageScroll_ = nullptr;
     QLabel *imageDisplay_ = nullptr;
 
@@ -180,14 +214,20 @@ private:
     QAction *calibrateAction_ = nullptr;
     QAction *compareAction_ = nullptr;
     QAction *poseAction_ = nullptr;
+    QAction *diagnosticsAction_ = nullptr;
+    QAction *undistortionComparisonAction_ = nullptr;
     QAction *exportAction_ = nullptr;
     QAction *batchExportAction_ = nullptr;
     QAction *openProjectAction_ = nullptr;
     QAction *saveProjectAction_ = nullptr;
+    QAction *saveProjectAsAction_ = nullptr;
     QAction *importAction_ = nullptr;
     QAction *clearAction_ = nullptr;
 
     QString lastDir_; ///< 文件对话框最近使用的目录
+    QString currentProjectPath_; ///< 当前项目路径；新会话为空
+    bool projectDirty_ = false; ///< 项目输入、配置或结果尚未保存
+    bool restoringProject_ = true; ///< 初始化与项目恢复期间抑制修改标记
     QPixmap currentPixmap_; ///< 未按窗口缩放的当前预览图
 
     // === 当前标定状态 ===

@@ -1,20 +1,32 @@
 #include "algorithm_comparison_dialog.h"
+#include "theme.h"
 
+#include <QAbstractItemView>
 #include <QDialogButtonBox>
 #include <QHeaderView>
 #include <QLabel>
+#include <QPushButton>
+#include <QString>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QVBoxLayout>
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <limits>
+#include <utility>
 
 namespace
 {
     QString modelName(CameraModel model)
     {
-        return model == CameraModel::Fisheye ? QStringLiteral("Fisheye") : QStringLiteral("Pinhole");
+        switch (model)
+        {
+            case CameraModel::Pinhole: return QStringLiteral("Pinhole");
+            case CameraModel::Fisheye: return QStringLiteral("Fisheye");
+        }
+        return QStringLiteral("--");
     }
 
     QString detectorName(const CalibrationOptions &options)
@@ -24,8 +36,8 @@ namespace
             return QStringLiteral("ChArUco");
         }
         return options.method == CalibrationMethod::SectorBased ?
-                QStringLiteral("Sector-Based") :
-                QStringLiteral("Classic");
+                QObject::tr("扇区法") :
+                QObject::tr("传统方法");
     }
 
     QTableWidgetItem *numberItem(double value, int precision)
@@ -35,18 +47,20 @@ namespace
         item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
         return item;
     }
+
 }
 
 AlgorithmComparisonDialog::AlgorithmComparisonDialog(
     std::vector<CalibrationResult> results, QWidget *parent)
-    : QDialog(parent)
+    : QDialog(parent),
+      results_(std::move(results))
 {
     setObjectName(QStringLiteral("AlgorithmComparisonDialog"));
     setWindowTitle(tr("算法结果对比"));
     resize(900, 360);
 
-    // 失败项统一后置；成功项按 RMS 从低到高展示
-    std::stable_sort(results.begin(), results.end(),
+    // 成功候选按 RMS 排序，失败项统一后置。
+    std::stable_sort(results_.begin(), results_.end(),
         [](const CalibrationResult &lhs,
     const CalibrationResult &rhs)
         {
@@ -54,17 +68,28 @@ AlgorithmComparisonDialog::AlgorithmComparisonDialog(
             {
                 return lhs.success;
             }
-            return lhs.rmsError < rhs.rmsError;
+            if (!lhs.success)
+            {
+                return false;
+            }
+            const double left = lhs.rmsError;
+            const double right = rhs.rmsError;
+            return (std::isfinite(left) ? left : std::numeric_limits<double>::infinity())
+                    < (std::isfinite(right) ? right : std::numeric_limits<double>::infinity());
         });
 
     auto *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(16, 16, 16, 12);
+    layout->setSpacing(12);
     auto *hint = new QLabel(
-        tr("RMS 较低只表示当前数据集的拟合误差较小；最终仍应结合去畸变效果、视场与参数稳定性选择模型。"),
+        tr("RMS 较低只表示当前图片的拟合误差较小；选择模型还应结合有效图片、角点、去畸变效果、视场与参数稳定性。"),
         this);
+    hint->setObjectName(QStringLiteral("algorithmComparisonHint"));
     hint->setWordWrap(true);
+    hint->setProperty("role", QStringLiteral("hint"));
     layout->addWidget(hint);
 
-    auto *table = new QTableWidget(static_cast<int>(results.size()), 9, this);
+    auto *table = new QTableWidget(static_cast<int>(results_.size()), 9, this);
     table->setObjectName(QStringLiteral("algorithmComparisonTable"));
     table->setHorizontalHeaderLabels(
         {
@@ -74,9 +99,14 @@ AlgorithmComparisonDialog::AlgorithmComparisonDialog(
         });
     table->setEditTriggers(QAbstractItemView::NoEditTriggers);
     table->setSelectionBehavior(QAbstractItemView::SelectRows);
-    for (int row = 0; row < static_cast<int>(results.size()); ++row)
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
+    table->setAlternatingRowColors(true);
+    table->setShowGrid(false);
+    table->verticalHeader()->setVisible(false);
+    table->verticalHeader()->setDefaultSectionSize(30);
+    for (int row = 0; row < static_cast<int>(results_.size()); ++row)
     {
-        const CalibrationResult &result = results[static_cast<size_t>(row)];
+        const CalibrationResult &result = results_[static_cast<size_t>(row)];
         table->setItem(row, 0,
             new QTableWidgetItem(modelName(result.options.cameraModel)));
         table->setItem(row, 1,
@@ -110,6 +140,38 @@ AlgorithmComparisonDialog::AlgorithmComparisonDialog(
     layout->addWidget(table);
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, this);
+    auto *applyButton = buttons->addButton(
+        tr("应用选中结果"), QDialogButtonBox::ActionRole);
+    applyButton->setObjectName(QStringLiteral("applyComparisonResultButton"));
+    applyButton->setEnabled(false);
+    applyButton->setProperty("role", QStringLiteral("primary"));
+    buttons->button(QDialogButtonBox::Close)->setText(tr("关闭"));
+    const auto selectedSuccessfulRow = [this, table]
+    {
+        const int row = table->currentRow();
+        return row >= 0 && row < static_cast<int>(results_.size())
+                && !table->selectedItems().isEmpty()
+                && results_[static_cast<size_t>(row)].success;
+    };
+    connect(table, &QTableWidget::itemSelectionChanged, this,
+        [applyButton, selectedSuccessfulRow]
+        {
+            applyButton->setEnabled(selectedSuccessfulRow());
+        });
+    connect(applyButton, &QPushButton::clicked, this,
+        [this, table, selectedSuccessfulRow]
+        {
+            if (!selectedSuccessfulRow())
+            {
+                return;
+            }
+            emit resultSelected(results_[static_cast<size_t>(table->currentRow())]);
+            accept();
+        });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     layout->addWidget(buttons);
+    if (!results_.empty())
+    {
+        table->selectRow(0);
+    }
 }

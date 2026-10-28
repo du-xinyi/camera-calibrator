@@ -8,12 +8,16 @@
 #include <optional>
 
 /**
- * @brief 可写入项目文件的标定输入快照
+ * @brief 可写入项目文件的完整标定会话快照
  */
 struct CalibrationProject
 {
     CalibrationOptions options; ///< 保存时的完整标定选项
     QStringList imagePaths; ///< 参与项目的图片路径
+    QStringList disabledImagePaths; ///< 暂不参与标定的图片，必须属于 imagePaths
+    std::optional<CalibrationResult> result; ///< 可选的完整标定结果或导入参数
+    bool resultImported = false; ///< 结果是否来自外部参数文件
+    QString resultWarning; ///< 加载时因输入变化而丢弃结果的说明，不写入项目
 };
 
 /**
@@ -26,7 +30,7 @@ public:
     /**
      * @brief 将项目序列化到 JSON 文件
      *
-     * @details 图片路径以项目文件目录为基准写成相对路径，目标文件仅在数据完整写入后提交
+     * @details 保存 v3 会话、相对图片路径和图片指纹，目标文件仅在数据完整写入后提交
      *
      * @param filePath 目标项目文件
      * @param project 待序列化的项目快照
@@ -41,7 +45,8 @@ public:
     /**
      * @brief 从 JSON 文件恢复标定项目
      *
-     * @details 仅接受受支持的格式版本和参数范围，并将相对图片路径解析为清理后的绝对路径
+     * @details 仅读取 v3 会话并解析相对路径。图片变化或缺失时仅丢弃结果，
+     * 通过 resultWarning 提示
      *
      * @param filePath 待读取的项目文件
      * @param error 接收失败原因，可为 nullptr

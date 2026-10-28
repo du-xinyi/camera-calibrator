@@ -82,7 +82,35 @@ struct CalibrationPose
     cv::Vec3d rotationVector; ///< 标定板到相机坐标系的旋转向量
     cv::Vec3d translationVector; ///< 标定板到相机坐标系的平移向量
     double reprojectionError = 0.0; ///< 本视图的重投影 RMS，单位为像素
+    std::vector<cv::Point2f> detectedPoints{}; ///< 原始图片中的检测角点，与 projectedPoints 一一对应
+    std::vector<cv::Point2f> projectedPoints{}; ///< 由当前模型和位姿重投影的原始像素坐标
 };
+
+/** @brief 单张图片的检测状态，不把未经证实的原因当作检测结论 */
+enum class ImageDetectionStatus
+{
+    NotProcessed,
+    Success,
+    ReadFailed,
+    SizeMismatch,
+    BoardNotFound,
+    InsufficientCorners,
+    ProcessingFailed,
+};
+
+/** @brief 图片读取、尺寸检查和标定板检测的具体结果 */
+struct ImageDetectionReport
+{
+    QString imagePath;
+    ImageDetectionStatus status = ImageDetectionStatus::NotProcessed;
+    QString message;
+    QSize actualSize;
+    QSize expectedSize;
+    int cornersFound = 0;
+};
+
+/** @brief 返回检测状态的中文短名 */
+QString imageDetectionStatusText(ImageDetectionStatus status);
 
 /**
  * @brief 标定求解或参数导入产生的结果对象
@@ -101,6 +129,17 @@ struct CalibrationResult
     std::vector<CalibrationPose> poses; ///< 各有效图片的外参与单图误差
     QString sourceDirectory; ///< 参数导出时建议使用的目录
     QString report; ///< 适合直接展示给用户的结果说明
+    std::vector<ImageDetectionReport> imageReports{}; ///< 已处理图片的具体检测结果，包含失败图片
+};
+
+/**
+ * @brief 未叠加角点的原图及其去畸变结果，失败时 error 非空且 undistorted 为空
+ */
+struct UndistortionPreview
+{
+    QImage original; ///< 未标注的原始图片
+    QImage undistorted; ///< 使用标定内参和相同输出分辨率校正后的图片
+    QString error; ///< 参数无效、读取失败或分辨率不匹配等错误说明
 };
 
 /**
@@ -115,7 +154,7 @@ public:
     /**
      * @brief 单图检测结束后的进度通知，参数依次为已处理数、总数和检测状态
      */
-    using ProgressCallback = std::function<void(int, int, bool)>;
+    using ProgressCallback = std::function<void(int, int, const ImageDetectionReport &)>;
 
     /**
      * @brief 返回 true 时请求批量求解尽快停止
@@ -132,13 +171,21 @@ public:
      * @param calib 可用于去畸变的标定结果
      * @param showUndistorted 是否请求显示去畸变结果
      * @param found 接收标定板是否可用于求解，可为 nullptr
+     * @param report 接收读取、尺寸检查和检测的具体结果，可为 nullptr
      *
      * @return 绘制检测结果后的图片；读取或处理失败时返回空 QImage
      */
     QImage previewImage(const QString &filePath,
         const CalibrationOptions &opts,
         const CalibrationResult &calib, bool showUndistorted,
-        bool *found = nullptr);
+        bool *found = nullptr, ImageDetectionReport *report = nullptr);
+
+    /**
+     * @brief 生成不带检测标注的原图与去畸变对照，严格要求输入与标定分辨率一致
+     * @details 不使用角点检测缓存；失败时通过 error 返回原因，不返回伪校正图
+     */
+    UndistortionPreview undistortionPreview(const QString &filePath,
+        const CalibrationResult &result) const;
 
     /**
      * @brief 从一组图片估计相机内参、畸变参数和逐图外参
@@ -173,7 +220,7 @@ public:
     /**
      * @brief 从 YAML 文件导入并验证相机参数
      *
-     * @details camera_matrix 可使用嵌套序列或 OpenCV matrix 表示；核心矩阵、焦距、分辨率和系数数量均会校验
+     * @details 仅接受当前 v3 格式：camera_matrix 为嵌套序列，畸变系数为 1×N OpenCV 矩阵；校验必需元数据及数值
      *
      * @param filePath 输入文件路径
      * @param error 接收失败原因，可为 nullptr
@@ -209,4 +256,5 @@ private:
     CalibrationOptions previewCacheOptions_; ///< 缓存对应的检测选项
     cv::Mat previewCacheAnnotated_; ///< 尚未去畸变的角点叠加图
     bool previewCacheFound_ = false; ///< 缓存检测是否满足求解条件
+    ImageDetectionReport previewCacheReport_; ///< 与检测图同步缓存的诊断信息，不包含临时标定尺寸约束
 };

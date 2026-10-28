@@ -11,15 +11,30 @@
  */
 class AlgorithmComparisonDialog: public QDialog
 {
+    Q_OBJECT
+
 public:
 
     /**
      * @brief 构造标定算法对比窗口
      *
-     * @param results 候选标定结果，窗口内部按成功状态和 RMS 重新排序
+     * @param results 候选结果；成功候选按 RMS 排序，失败项后置
      * @param parent 所属窗口，允许为空
      */
     explicit AlgorithmComparisonDialog(
         std::vector<CalibrationResult> results,
         QWidget *parent = nullptr);
+
+signals:
+
+    /**
+     * @brief 用户确认应用一个成功的候选结果
+     *
+     * @param result 已选候选；接收方应在对话框销毁前保存需要的数据
+     */
+    void resultSelected(const CalibrationResult &result);
+
+private:
+
+    std::vector<CalibrationResult> results_; ///< 与表格行顺序一致的候选结果
 };
