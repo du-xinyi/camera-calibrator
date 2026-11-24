@@ -138,9 +138,10 @@ public:
      *
      * @param result 含有效外参的标定结果
      * @param parent Qt 对象树中的父窗口，允许为空
+     * @param allowRecalibration 位姿对应当前标定图片时允许停用图片并重新标定
      */
     explicit PoseResultDialog(const CalibrationResult &result,
-        QWidget *parent = nullptr);
+        QWidget *parent = nullptr, bool allowRecalibration = true);
 
     /**
      * @brief 销毁位姿窗口

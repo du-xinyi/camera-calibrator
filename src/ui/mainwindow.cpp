@@ -16,6 +16,9 @@
 #include <QComboBox>
 #include <QDir>
 #include <QDoubleSpinBox>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFileInfoList>
@@ -23,6 +26,7 @@
 #include <QFutureWatcher>
 #include <QIcon>
 #include <QImage>
+#include <QImageIOHandler>
 #include <QImageReader>
 #include <QLabel>
 #include <QListWidget>
@@ -30,6 +34,7 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QMimeData>
 #include <QPalette>
 #include <QPixmap>
 #include <QProgressDialog>
@@ -44,8 +49,10 @@
 #include <QStandardPaths>
 #include <QStatusBar>
 #include <QStyle>
+#include <QTemporaryDir>
 #include <QTimer>
 #include <QToolBar>
+#include <QUrl>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -109,14 +116,39 @@ namespace
 
     QString supportedImageDialogFilter()
     {
-        const auto formats = QImageReader::supportedImageFormats();
-        QStringList exts;
-        exts.reserve(formats.size());
-        for (const QByteArray &fmt: formats)
+        return QStringLiteral("图片 (%1)").arg(supportedImageNameFilters().join(QLatin1Char(' ')));
+    }
+
+    QStringList imagesInFolder(const QString &path)
+    {
+        const QDir directory(path);
+        const auto entries = directory.entryInfoList(supportedImageNameFilters(),
+            QDir::Files | QDir::Readable, QDir::Name);
+        QStringList files;
+        for (const QFileInfo &entry: entries)
         {
-            exts << QStringLiteral("*.") + QString::fromLatin1(fmt);
+            files << entry.absoluteFilePath();
         }
-        return QStringLiteral("图片 (%1)").arg(exts.join(QLatin1Char(' ')));
+        return files;
+    }
+
+    QFileInfoList droppedImageSources(const QMimeData *data)
+    {
+        const auto filters = supportedImageNameFilters();
+        QFileInfoList sources;
+        const auto urls = data->urls();
+        for (const QUrl &url: urls)
+        {
+            if (url.isLocalFile())
+            {
+                const QFileInfo info(url.toLocalFile());
+                if (info.isDir() || (info.isFile() && QDir::match(filters, info.fileName())))
+                {
+                    sources << info;
+                }
+            }
+        }
+        return sources;
     }
 
     bool sameCalibrationOptions(const CalibrationOptions &lhs,
@@ -134,11 +166,15 @@ namespace
                 && lhs.radialCoeffs == rhs.radialCoeffs;
     }
 
-    QString resultRmsText(const CalibrationResult &result, bool imported = false)
+    QString resultRmsText(const CalibrationResult &result)
     {
-        QString text = QObject::tr("RMS %1 px%2").arg(result.rmsError, 0, 'f', 3)
-                .arg(imported ? QObject::tr("（导入）") : QString{});
-        return text;
+        if (!result.success)
+        {
+            return QStringLiteral("--");
+        }
+        return result.hasMetadata(QStringLiteral("rms_reprojection_error"))
+            ? QObject::tr("%1 px").arg(result.rmsError, 0, 'f', 3)
+            : QObject::tr("未提供");
     }
 
     void setComboValue(QComboBox *combo, int value)
@@ -156,6 +192,7 @@ MainWindow::MainWindow(QWidget *parent)
       ui_(std::make_unique<Ui::MainWindow>())
 {
     ui_->setupUi(this);
+    setAcceptDrops(true);
 
 #ifdef PROJECT_SOURCE_DIR
 
@@ -503,13 +540,14 @@ void MainWindow::updateResultSummary()
     const CalibrationResult &result = lastResult_;
     const bool valid = result.success && result.cameraMatrix.rows == 3
             && result.cameraMatrix.cols == 3;
-    const char *state = !result.success ? "empty" : result.qualityWarning ? "warning" : "good";
-    statusRmsError_->setText(result.success ? resultRmsText(result, lastResultImported_)
-        : tr("RMS --"));
+    const char *state = !result.success || !result.hasMetadata(QStringLiteral("quality_warning"))
+        ? "empty" : result.qualityWarning ? "warning" : "good";
+    const QString rmsText = resultRmsText(result);
+    statusRmsError_->setText(tr("RMS %1%2").arg(rmsText,
+        lastResultImported_ ? tr("（导入）") : QString{}));
     setStyleState(statusRmsError_, state);
 
-    ui_->resultRmsValue->setText(result.success
-        ? tr("%1 px").arg(result.rmsError, 0, 'f', 3) : QStringLiteral("--"));
+    ui_->resultRmsValue->setText(rmsText);
     setStyleState(ui_->resultRmsValue, state);
     if (!valid)
     {
@@ -526,10 +564,11 @@ void MainWindow::updateResultSummary()
     {
         details += tr("\n来源：导入参数");
     }
-    else
-    {
-        details += tr("\n有效图片 %1 / %2").arg(result.imagesUsed).arg(result.imagesTotal);
-    }
+    const QString imagesUsed = result.hasMetadata(QStringLiteral("images_used"))
+        ? QString::number(result.imagesUsed) : tr("未提供");
+    const QString imagesTotal = result.hasMetadata(QStringLiteral("images_total"))
+        ? QString::number(result.imagesTotal) : tr("未提供");
+    details += tr("\n有效图片 %1 / %2").arg(imagesUsed, imagesTotal);
     if (result.imageSize.isValid())
     {
         details += tr("\n分辨率 %1 × %2").arg(result.imageSize.width())
@@ -683,6 +722,7 @@ void MainWindow::invalidateCalibrationResult()
     if (poseDialog_)
     {
         poseDialog_->close();
+        poseDialog_.clear();
     }
     updateUiState();
 }
@@ -717,19 +757,7 @@ void MainWindow::onAddImagesFromFolder()
     }
     lastDir_ = dir;
 
-    QDir directory(dir);
-    directory.setNameFilters(supportedImageNameFilters());
-    directory.setFilter(QDir::Files | QDir::Readable);
-    directory.setSorting(QDir::Name);
-    const QFileInfoList entries = directory.entryInfoList();
-
-    QStringList files;
-    files.reserve(entries.size());
-    for (const QFileInfo &info: entries)
-    {
-        files << info.absoluteFilePath();
-    }
-
+    const QStringList files = imagesInFolder(dir);
     if (files.isEmpty())
     {
         QMessageBox::information(this, tr("从文件夹添加"),
@@ -737,6 +765,51 @@ void MainWindow::onAddImagesFromFolder()
         return;
     }
     loadImages(files);
+}
+
+void MainWindow::dragEnterEvent(QDragEnterEvent *event)
+{
+    if (!isBusy() && event->possibleActions().testFlag(Qt::CopyAction)
+        && !droppedImageSources(event->mimeData()).isEmpty())
+    {
+        event->setDropAction(Qt::CopyAction);
+        event->accept();
+    }
+}
+
+void MainWindow::dropEvent(QDropEvent *event)
+{
+    if (isBusy() || !event->possibleActions().testFlag(Qt::CopyAction))
+    {
+        return;
+    }
+    const auto sources = droppedImageSources(event->mimeData());
+    if (sources.isEmpty())
+    {
+        return;
+    }
+    QStringList files;
+    for (const QFileInfo &source: sources)
+    {
+        if (source.isDir())
+        {
+            files << imagesInFolder(source.absoluteFilePath());
+        }
+        else
+        {
+            files << source.absoluteFilePath();
+        }
+    }
+    if (files.isEmpty())
+    {
+        statusBar()->showMessage(tr("拖入的文件夹中未找到图片文件。"), 5000);
+    }
+    else
+    {
+        loadImages(files);
+    }
+    event->setDropAction(Qt::CopyAction);
+    event->accept();
 }
 
 void MainWindow::onOpenProject()
@@ -773,9 +846,12 @@ void MainWindow::onOpenProject()
     applyOptions(project->options);
     loadImages(project->imagePaths);
     setImageParticipation(project->disabledImagePaths, false);
+    // 导入参数保留原始精度，编辑控件按自身精度显示标定选项。
+    const bool optionsRestored = project->resultImported
+        || sameCalibrationOptions(project->options, currentOptions());
     if (project->result.has_value()
         && collectFiles(false).size() == project->imagePaths.size()
-        && sameCalibrationOptions(project->options, currentOptions()))
+        && optionsRestored)
     {
         lastResult_ = *project->result;
         lastResultImported_ = project->resultImported;
@@ -788,8 +864,7 @@ void MainWindow::onOpenProject()
     }
     lastDir_ = QFileInfo(path).absolutePath();
     currentProjectPath_ = QFileInfo(path).absoluteFilePath();
-    setProjectModified(!project->resultWarning.isEmpty()
-        || !sameCalibrationOptions(project->options, currentOptions()));
+    setProjectModified(!project->resultWarning.isEmpty() || !optionsRestored);
     if (!project->resultWarning.isEmpty()
         || (project->result.has_value() && !lastResult_.success))
     {
@@ -833,7 +908,7 @@ bool MainWindow::saveProject(bool saveAs)
     }
     QString error;
     CalibrationProject project;
-    project.options = currentOptions();
+    project.options = lastResultImported_ ? lastResult_.options : currentOptions();
     project.imagePaths = collectFiles(false);
     for (int row = 0; row < imageList_->count(); ++row)
     {
@@ -885,6 +960,7 @@ void MainWindow::onImportParameters()
     {
         return;
     }
+    invalidateCalibrationResult();
     applyOptions(result->options);
     lastResult_ = *result;
     lastResultImported_ = true;
@@ -896,7 +972,12 @@ void MainWindow::onImportParameters()
     for (const QString &file: collectFiles())
     {
         QImageReader reader(file);
-        if (reader.size().isValid() && reader.size() != result->imageSize)
+        QSize size = reader.size();
+        if (reader.transformation().testFlag(QImageIOHandler::TransformationRotate90))
+        {
+            size.transpose();
+        }
+        if (size.isValid() && size != result->imageSize)
         {
             mismatches << QFileInfo(file).fileName();
         }
@@ -1223,12 +1304,10 @@ void MainWindow::onShowPoses()
         return;
     }
 
-    auto *dialog = new PoseResultDialog(lastResult_, this);
+    auto *dialog = new PoseResultDialog(lastResult_, this, !lastResultImported_);
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     connect(dialog, &PoseResultDialog::excludeImagesRequested,
         this, &MainWindow::onExcludeImagesAndRecalibrate);
-    connect(dialog, &QObject::destroyed,
-        this, [this] { poseDialog_ = nullptr; });
     poseDialog_ = dialog;
     dialog->show();
     dialog->raise();
@@ -1276,7 +1355,7 @@ void MainWindow::onShowUndistortionComparison()
 void MainWindow::onExcludeImagesAndRecalibrate(
     const QStringList &imagePaths, double baselineRms)
 {
-    if (isBusy() || !lastResult_.success || imagePaths.isEmpty())
+    if (isBusy() || !lastResult_.success || lastResultImported_ || imagePaths.isEmpty())
     {
         return;
     }
@@ -1397,7 +1476,7 @@ void MainWindow::onExportUndistortedImages()
                 auxiliaryProgressDialog_ = nullptr;
             }
             updateUiState();
-            QString message = auxiliaryCanceled_.load() ? tr("批量导出已取消。\n") : QString();
+            QString message = summary.canceled ? tr("批量导出已取消。\n") : QString();
             message += tr("已导出 %1 张，跳过 %2 张。\n输出目录：%3")
                     .arg(summary.written)
                     .arg(summary.skipped)
@@ -1421,39 +1500,57 @@ void MainWindow::onExportUndistortedImages()
         [this, worker, files, outputDirectory, calibration]
         {
             BatchUndistortSummary summary;
-            QSet<QString> outputNames;
+            const QDir outputDir(outputDirectory);
+            const QSet<QString> inputPaths(files.cbegin(), files.cend());
+            QTemporaryDir staging(outputDir.filePath(QStringLiteral(".undistort-XXXXXX")));
+            if (!staging.isValid())
+            {
+                summary.skipped = files.size();
+                summary.errors << tr("无法在输出目录创建临时文件夹：%1").arg(staging.errorString());
+                return summary;
+            }
             for (int index = 0; index < files.size(); ++index)
             {
                 if (auxiliaryCanceled_.load())
                 {
+                    summary.canceled = true;
                     break;
                 }
                 const QFileInfo inputInfo(files[index]);
-                QString base = inputInfo.completeBaseName();
+                const QString base = inputInfo.completeBaseName() + QStringLiteral("_undistorted");
                 QString suffix = inputInfo.suffix().toLower();
                 if (suffix.isEmpty())
                 {
                     suffix = QStringLiteral("png");
                 }
 
-                // 不同输入目录可能出现同名文件，输出名需在本批任务内保持唯一
-                QString outputName = base + QStringLiteral("_undistorted.") + suffix;
-                int duplicateIndex = 2;
-                while (outputNames.contains(outputName))
-                {
-                    outputName = base + QStringLiteral("_undistorted_%1.")
-                            .arg(duplicateIndex++)
-                            + suffix;
-                }
-                outputNames.insert(outputName);
                 QString error;
-                if (worker->undistortImageFile(
-                    files[index], QDir(outputDirectory).filePath(outputName),
-                    calibration, &error))
+                QFile staged(staging.filePath(QStringLiteral("image.") + suffix));
+                if (worker->undistortImageFile(files[index], staged.fileName(), calibration, &error))
                 {
-                    ++summary.written;
+                    // 编码完成后才发布文件；QFile::rename 遇到已有目标时保留原文件。
+                    QString name = base;
+                    for (int number = 2; ; ++number)
+                    {
+                        const QString target = outputDir.filePath(name + QLatin1Char('.') + suffix);
+                        if (!inputPaths.contains(target))
+                        {
+                            if (staged.rename(target))
+                            {
+                                ++summary.written;
+                                break;
+                            }
+                            const QFileInfo occupied(target);
+                            if (!occupied.exists() && !occupied.isSymLink())
+                            {
+                                error = staged.errorString();
+                                break;
+                            }
+                        }
+                        name = base + QStringLiteral("_%1").arg(number);
+                    }
                 }
-                else
+                if (!error.isEmpty())
                 {
                     ++summary.skipped;
                     summary.errors << tr("%1：%2")
@@ -1636,6 +1733,9 @@ void MainWindow::onBoardTypeChanged()
     const bool isCharuco =
             boardTypeCombo_->currentData().toInt()
             == static_cast<int>(CalibrationBoardType::Charuco);
+    const int minimumSquares = isCharuco ? 2 : 4;
+    boardColsSpin_->setMinimum(minimumSquares);
+    boardRowsSpin_->setMinimum(minimumSquares);
     ui_->markerSizeLabel->setVisible(isCharuco);
     markerSizeSpin_->setVisible(isCharuco);
     ui_->dictionaryLabel->setVisible(isCharuco);
@@ -1839,26 +1939,20 @@ void MainWindow::showImage(const QString &filePath, bool *found)
 {
     bool detected = false;
     ImageDetectionReport report;
-    bool applyUndistortion = showUndistortedCheck_->isChecked();
-    if (applyUndistortion && lastResult_.success
-        && lastResult_.imageSize.isValid())
-    {
-        QImageReader reader(filePath);
-        if (reader.size().isValid() && reader.size() != lastResult_.imageSize)
-        {
-            applyUndistortion = false;
-            statusBar()->showMessage(
-                tr("当前图片为 %1×%2，标定参数适用于 %3×%4；未应用去畸变。")
-                .arg(reader.size().width())
-                .arg(reader.size().height())
-                .arg(lastResult_.imageSize.width())
-                .arg(lastResult_.imageSize.height()),
-                8000);
-        }
-    }
+    const bool applyUndistortion = showUndistortedCheck_->isChecked();
     const QImage annotated = calibrator_.previewImage(
         filePath, currentOptions(), lastResult_,
         applyUndistortion, &detected, &report);
+    if (applyUndistortion && report.status == ImageDetectionStatus::SizeMismatch)
+    {
+        statusBar()->showMessage(
+            tr("当前图片为 %1×%2，标定参数适用于 %3×%4；未应用去畸变。")
+            .arg(report.actualSize.width())
+            .arg(report.actualSize.height())
+            .arg(report.expectedSize.width())
+            .arg(report.expectedSize.height()),
+            8000);
+    }
     currentPixmap_ = QPixmap::fromImage(annotated);
     fitImageToView();
     if (!isBusy())

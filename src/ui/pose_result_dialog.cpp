@@ -468,18 +468,34 @@ void PoseVisualizationWidget::wheelEvent(QWheelEvent *event)
 }
 
 PoseResultDialog::PoseResultDialog(const CalibrationResult &result,
-    QWidget *parent)
+    QWidget *parent, bool allowRecalibration)
     : QDialog(parent),
       ui_(std::make_unique<Ui::PoseResultDialog>()),
       baselineRms_(result.rmsError)
 {
     ui_->setupUi(this);
     Theme::repolish(this);
-    ui_->poseVisualization->setCalibrationResult(result);
+    const bool hasBoardGeometry = result.hasMetadata(QStringLiteral("board_columns"))
+        && result.hasMetadata(QStringLiteral("board_rows"))
+        && result.hasMetadata(QStringLiteral("square_size_mm"));
+    if (hasBoardGeometry)
+    {
+        ui_->poseVisualization->setCalibrationResult(result);
+    }
+    else
+    {
+        ui_->poseVisualization->hide();
+        ui_->viewStyleLabel->hide();
+        ui_->viewStyleCombo->hide();
+        ui_->conventionLabel->setText(tr("缺少标定板尺寸，无法绘制三维视图。"
+            "外参约定为 X_camera = R · X_board + t。"));
+    }
+    const QString rms = result.hasMetadata(QStringLiteral("rms_reprojection_error"))
+        ? tr("%1 px").arg(result.rmsError, 0, 'f', 3) : tr("未提供");
     ui_->summaryLabel->setText(
-        tr("%1 个有效位姿 · RMS %2 px · 按单图 RMS 降序 · 红色 > %3 px")
+        tr("%1 个有效位姿 · RMS %2 · 按单图 RMS 降序 · 红色 > %3 px")
         .arg(result.poses.size())
-        .arg(result.rmsError, 0, 'f', 3)
+        .arg(rms)
         .arg(kPerViewRmsWarningThresholdPx, 0, 'f', 1));
     populatePoseTable(result);
 
@@ -487,6 +503,8 @@ PoseResultDialog::PoseResultDialog(const CalibrationResult &result,
         tr("排除所选并重新标定"), QDialogButtonBox::ActionRole);
     excludeButton_->setObjectName(
         QStringLiteral("excludeAndRecalibrateButton"));
+    excludeButton_->setVisible(allowRecalibration);
+    ui_->poseTable->setColumnHidden(0, !allowRecalibration);
 
     ui_->poseSplitter->setStretchFactor(0, 3);
     ui_->poseSplitter->setStretchFactor(1, 2);

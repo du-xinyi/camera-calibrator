@@ -269,9 +269,14 @@ namespace
         const int coefficients = options.cameraModel == CameraModel::Fisheye ? 4 : 5;
         if (!result.success || !sameOptions(result.options, options)
             || !std::isfinite(result.rmsError) || result.rmsError < 0.0
-            || result.imagesUsed < 0 || result.imagesTotal < result.imagesUsed
-            || result.poses.size() > static_cast<std::size_t>(result.imagesUsed)
-            || result.imageReports.size() > static_cast<std::size_t>(result.imagesTotal)
+            || result.imagesUsed < 0 || result.imagesTotal < 0
+            || (result.hasMetadata("images_total") && result.hasMetadata("images_used")
+                && result.imagesTotal < result.imagesUsed)
+            || (result.hasMetadata("images_used")
+                && result.poses.size() > static_cast<std::size_t>(result.imagesUsed))
+            || (result.hasMetadata("images_total")
+                && (result.imageReports.size() > static_cast<std::size_t>(result.imagesTotal)
+                    || result.poses.size() > static_cast<std::size_t>(result.imagesTotal)))
             || result.imageSize.width() <= 0 || result.imageSize.height() <= 0
             || matrix.type() != CV_64FC1 || matrix.rows != 3 || matrix.cols != 3
             || distortion.type() != CV_64FC1 || (distortion.rows != 1 && distortion.cols != 1)
@@ -403,15 +408,11 @@ namespace
 
     QJsonObject resultObject(const CalibrationResult &result, const QDir &baseDirectory)
     {
-        return {
+        QJsonObject object{
             {QStringLiteral("camera_model"), enumName(result.options.cameraModel)},
             {QStringLiteral("success"), result.success},
-            {QStringLiteral("quality_warning"), result.qualityWarning},
-            {QStringLiteral("rms"), result.rmsError},
             {QStringLiteral("camera_matrix"), matrixObject(result.cameraMatrix)},
             {QStringLiteral("distortion_coefficients"), matrixObject(result.distCoeffs)},
-            {QStringLiteral("images_used"), result.imagesUsed},
-            {QStringLiteral("images_total"), result.imagesTotal},
             {QStringLiteral("image_width"), result.imageSize.width()},
             {QStringLiteral("image_height"), result.imageSize.height()},
             {QStringLiteral("poses"), poseObjects(result.poses, baseDirectory)},
@@ -420,6 +421,29 @@ namespace
                 ? QString() : baseDirectory.relativeFilePath(result.sourceDirectory)},
             {QStringLiteral("report"), result.report},
         };
+        if (result.importedMetadataFields)
+        {
+            QStringList fields = result.importedMetadataFields->values();
+            fields.sort();
+            object.insert(QStringLiteral("imported_metadata_fields"), QJsonArray::fromStringList(fields));
+        }
+        if (result.hasMetadata("rms_reprojection_error"))
+        {
+            object.insert("rms", result.rmsError);
+        }
+        if (result.hasMetadata("quality_warning"))
+        {
+            object.insert("quality_warning", result.qualityWarning);
+        }
+        if (result.hasMetadata("images_used"))
+        {
+            object.insert("images_used", result.imagesUsed);
+        }
+        if (result.hasMetadata("images_total"))
+        {
+            object.insert("images_total", result.imagesTotal);
+        }
+        return object;
     }
 
     bool readPoints(const QJsonValue &value, std::vector<cv::Point2f> *points)
@@ -554,18 +578,30 @@ namespace
     {
         CalibrationResult result;
         result.options = options;
+        const QJsonValue fields = object.value(QStringLiteral("imported_metadata_fields"));
+        if (!fields.isUndefined())
+        {
+            if (!fields.isArray()) return std::nullopt;
+            result.importedMetadataFields.emplace();
+            for (const auto &field: fields.toArray())
+            {
+                if (!field.isString()) return std::nullopt;
+                result.importedMetadataFields->insert(field.toString());
+            }
+        }
         int width = 0;
         int height = 0;
         CameraModel storedModel;
         if (!parseEnum(object.value(QStringLiteral("camera_model")).toString(), &storedModel)
             || storedModel != options.cameraModel
             || !object.value(QStringLiteral("success")).isBool()
-            || !object.value(QStringLiteral("quality_warning")).isBool()
+            || (result.hasMetadata("quality_warning") && !object.value("quality_warning").isBool())
+            || (result.hasMetadata("rms_reprojection_error") && !object.value("rms").isDouble())
             || !object.value(QStringLiteral("poses")).isArray()
             || !object.value(QStringLiteral("report")).isString()
             || !object.value(QStringLiteral("source_directory")).isString()
-            || !readInteger(object.value(QStringLiteral("images_used")), &result.imagesUsed)
-            || !readInteger(object.value(QStringLiteral("images_total")), &result.imagesTotal)
+            || (result.hasMetadata("images_used") && !readInteger(object.value("images_used"), &result.imagesUsed))
+            || (result.hasMetadata("images_total") && !readInteger(object.value("images_total"), &result.imagesTotal))
             || !readInteger(object.value(QStringLiteral("image_width")), &width)
             || !readInteger(object.value(QStringLiteral("image_height")), &height)
             || !readMatrix(object.value(QStringLiteral("camera_matrix")), &result.cameraMatrix)
@@ -575,8 +611,7 @@ namespace
         }
         result.success = object.value(QStringLiteral("success")).toBool();
         result.qualityWarning = object.value(QStringLiteral("quality_warning")).toBool();
-        result.rmsError = object.value(QStringLiteral("rms"))
-            .toDouble(std::numeric_limits<double>::quiet_NaN());
+        result.rmsError = object.value(QStringLiteral("rms")).toDouble();
         result.imageSize = {width, height};
         result.report = object.value(QStringLiteral("report")).toString();
         const QString source = object.value(QStringLiteral("source_directory")).toString();

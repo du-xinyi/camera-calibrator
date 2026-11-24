@@ -117,7 +117,7 @@
                                                 <widget class="QLabel" name="imageListEmptyLabel">
                                                     <property name="text">
                                                         <string>暂无图片
-使用工具栏添加图片或文件夹</string>
+将图片或文件夹拖到窗口，或从工具栏添加</string>
                                                     </property>
                                                     <property name="alignment">
                                                         <set>Qt::AlignCenter</set>

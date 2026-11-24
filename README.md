@@ -28,6 +28,7 @@
 - 支持 C++17 的编译器
 - Qt 6：`Widgets`、`Concurrent`
 - OpenCV 5：`calib`、`geometry`、`objdetect`、`imgproc`、`imgcodecs`
+- yaml-cpp 开发库（Debian / Ubuntu 包名为 `libyaml-cpp-dev`），用于读取 PyYAML 等工具生成的标准 YAML。
 
 CMake 会尝试通过 `qmake6` 和常见安装目录自动定位 Qt 6，并优先使用系统中的 OpenCV 5 配置。
 
@@ -94,7 +95,7 @@ cmake -S . -B build \
 
 界面中的“方格数”表示完整方格数量：
 
-- 普通棋盘格内部角点数为 `(列数 - 1) × (行数 - 1)`。
+- 普通棋盘格的行、列各至少 4 个方格，内部角点数为 `(列数 - 1) × (行数 - 1)`。
 - ChArUco 使用完整方格数创建标定板模型。
 - 方格尺寸和标记尺寸使用毫米，导出的平移向量也以毫米为单位。
 - ChArUco 的标记尺寸必须小于方格尺寸，“标记字典”必须与实物一致。
@@ -141,6 +142,8 @@ cmake -S . -B build \
 
 完成标定或导入有效参数后，在图片列表选中一张图片，点击“去畸变对比”。可选择并排显示或拖动分割线查看原图与校正图，使用滚轮或按钮同步缩放、拖动平移，并通过“适应窗口”和“100%”调整视图。对比使用未叠加角点的图片；输入分辨率必须与参数一致。
 
+带 EXIF 方向标记的照片按显示方向判断标定分辨率。批量导出时，若目标目录已有同名文件，程序会在新文件名末尾追加 `_2`、`_3` 等序号，保留原图和已有结果。
+
 ## 项目与参数文件
 
 ### 标定项目
@@ -159,7 +162,19 @@ cmake -S . -B build \
 
 ### YAML 参数
 
-YAML 参数只读取当前版本 `3`，需包含程序导出的完整字段。`Pinhole`、`Fisheye` 的畸变系数分别为 `1×5`、`1×4`，`camera_model` 分别写为 `pinhole`、`fisheye`。以下为完整的 `Pinhole` / `ChArUco` 参数示例：
+导入参数用于去畸变时，只需提供相机模型、宽度、高度、内参矩阵和畸变系数。以下是可直接导入的针孔模型示例。
+
+```yaml
+camera_model: pinhole
+image_width: 1920
+image_height: 1080
+camera_matrix: [[820.0, 0.0, 960.0], [0.0, 821.0, 540.0], [0.0, 0.0, 1.0]]
+distortion_coefficients: [-0.21, 0.05, 0.001, -0.001, -0.004]
+```
+
+鱼眼模型使用 `camera_model: fisheye` 和 4 个畸变系数。若提供 `format_version`，其值须为 `3`。标定板、求解选项、误差统计和位姿均可省略。界面将缺失的 RMS 和图片数显示为“未提供”，保存项目或再次导出会保留这些字段的缺失状态。
+
+本程序完成针孔模型的 ChArUco 标定后，导出的 YAML 还包含求解所用的配置与统计，如下所示。
 
 ```yaml
 format_version: 3
@@ -190,9 +205,9 @@ distortion_coefficients: !!opencv-matrix
 poses: []
 ```
 
-导出文件还包含每张图片的 `poses`（旋转向量、平移向量和单图误差），以及标定板与畸变选项等元信息，方便复现和追溯。
+如果提供 `poses`，每项须包含图片路径 `image`、三分量旋转向量 `rotation_vector`、三分量平移向量 `translation_vector` 和单图误差 `reprojection_error`。导出时按目标 YAML 所在目录计算图片相对路径，来自不同目录的同名图片各自保留对应位姿。
 
-`camera_matrix` 使用 3×3 嵌套数组，`distortion_coefficients` 使用 OpenCV `!!opencv-matrix` 行向量。参数文件必须包含有效的 `image_width` 和 `image_height`。
+本程序导出时，`camera_matrix` 使用 3×3 嵌套数组，`distortion_coefficients` 使用 OpenCV `!!opencv-matrix` 行向量。
 
 相机参数只适用于标定分辨率。图片尺寸不一致时，预览不会应用去畸变，批量导出也会跳过对应图片。
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QImage>
+#include <QSet>
 #include <QSize>
 #include <QString>
 #include <QStringList>
@@ -130,6 +131,13 @@ struct CalibrationResult
     QString sourceDirectory; ///< 参数导出时建议使用的目录
     QString report; ///< 适合直接展示给用户的结果说明
     std::vector<ImageDetectionReport> imageReports{}; ///< 已处理图片的具体检测结果，包含失败图片
+    std::optional<QSet<QString>> importedMetadataFields; ///< 导入文件实际提供的可选字段；本地标定和旧项目没有此清单
+
+    /// 按 YAML 字段名区分实际记录的元数据与界面使用的缺省值。
+    bool hasMetadata(const QString &field) const
+    {
+        return !importedMetadataFields || importedMetadataFields->contains(field);
+    }
 };
 
 /**
@@ -220,7 +228,8 @@ public:
     /**
      * @brief 从 YAML 文件导入并验证相机参数
      *
-     * @details 仅接受当前 v3 格式：camera_matrix 为嵌套序列，畸变系数为 1×N OpenCV 矩阵；校验必需元数据及数值
+     * @details 必需字段为相机模型、分辨率、内参与畸变系数。若声明格式版本，须为 v3。
+     * 可选标定配置、统计和逐图位姿随结果保留。
      *
      * @param filePath 输入文件路径
      * @param error 接收失败原因，可为 nullptr

@@ -1,11 +1,18 @@
+#include "calibration.h"
 #include "image_comparison_dialog.h"
+#include "image_quality.h"
 
 #include <QApplication>
+#include <QBuffer>
+#include <QByteArray>
 #include <QColor>
 #include <QComboBox>
 #include <QDebug>
 #include <QDir>
+#include <QFile>
 #include <QImage>
+#include <QImageReader>
+#include <QImageWriter>
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
@@ -13,10 +20,15 @@
 #include <QPixmap>
 #include <QPushButton>
 #include <QString>
+#include <QTemporaryDir>
 #include <QWheelEvent>
 #include <QWidget>
 #include <QtGlobal>
 
+#include <opencv2/geometry/3d.hpp>
+#include <opencv2/imgcodecs.hpp>
+
+#include <cmath>
 #include <cstdlib>
 #include <exception>
 #include <stdexcept>
@@ -212,6 +224,140 @@ namespace
         ImageComparisonDialog mismatchDialog(original, differentSize);
         verifyDisabled(mismatchDialog);
     }
+
+    void testFisheyeSkew(const QTemporaryDir &directory)
+    {
+        const QString source = directory.filePath(QStringLiteral("fish.png"));
+        const QString destination = directory.filePath(QStringLiteral("fish-corrected.png"));
+        cv::Mat input(120, 160, CV_16UC4);
+        for (int y = 0; y < input.rows; ++y)
+        {
+            for (int x = 0; x < input.cols; ++x)
+            {
+                input.at<cv::Vec4w>(y, x) = {0, static_cast<ushort>(y * 256),
+                    static_cast<ushort>(x * 256), 48000};
+            }
+        }
+        require(cv::imwrite(source.toStdString(), input), "无法创建鱼眼像素坐标图");
+
+        CalibrationResult result;
+        result.success = true;
+        result.options.cameraModel = CameraModel::Fisheye;
+        result.imageSize = {input.cols, input.rows};
+        const cv::Matx33d intrinsic(75, 12, 80, 0, 75, 60, 0, 0, 1);
+        const cv::Vec4d distortion(-0.03, 0.01, 0, 0);
+        result.cameraMatrix = cv::Mat(intrinsic);
+        result.distCoeffs = cv::Mat(distortion);
+        const QPoint sample(123, 108);
+        const cv::Vec3d ray = intrinsic.inv() * cv::Vec3d(sample.x(), sample.y(), 1);
+        const std::vector<cv::Point3d> rays{{ray[0], ray[1], ray[2]}};
+        std::vector<cv::Point2d> projected;
+        cv::fisheye::projectPoints(rays, projected, cv::Vec3d(), cv::Vec3d(),
+            intrinsic, distortion, intrinsic(0, 1) / intrinsic(0, 0));
+        const cv::Point2d expected = projected.front();
+
+        Calibrator calibrator;
+        const auto comparison = calibrator.undistortionPreview(source, result);
+        const auto preview = calibrator.previewImage(source, result.options, result, true);
+        for (const QImage &image: {comparison.undistorted, preview})
+        {
+            require(!image.isNull(), "非零轴倾斜的鱼眼预览失败");
+            const QColor color = image.pixelColor(sample);
+            require(std::abs(color.red() - expected.x) < 1.0
+                    && std::abs(color.green() - expected.y) < 1.0,
+                "鱼眼预览的采样位置没有包含源相机的轴倾斜");
+        }
+        QString error;
+        require(calibrator.undistortImageFile(source, destination, result, &error),
+            "鱼眼批量去畸变失败");
+        const cv::Mat output = cv::imread(destination.toStdString(), cv::IMREAD_UNCHANGED);
+        require(output.type() == CV_16UC4 && output.size() == input.size(),
+            "去畸变输出丢失原图位深、通道或分辨率");
+        const auto pixel = output.at<cv::Vec4w>(sample.y(), sample.x());
+        require(std::abs(pixel[2] / 256.0 - expected.x) < 0.1
+                && std::abs(pixel[1] / 256.0 - expected.y) < 0.1 && pixel[3] == 48000,
+            "鱼眼批量去畸变的采样位置或透明度错误");
+    }
+
+    void testExifOrientation(const QTemporaryDir &directory)
+    {
+        QImage original(80, 50, QImage::Format_RGB32);
+        original.fill(Qt::red);
+        {
+            QPainter painter(&original);
+            painter.fillRect(0, 0, 40, 25, Qt::green);
+            painter.fillRect(40, 25, 40, 25, Qt::blue);
+        }
+        QByteArray jpeg;
+        QBuffer buffer(&jpeg);
+        require(buffer.open(QIODevice::WriteOnly) && original.save(&buffer, "JPEG"),
+            "无法创建 EXIF 方向测试 JPEG");
+
+        CalibrationResult result;
+        result.success = true;
+        result.imageSize = {50, 80};
+        result.cameraMatrix = cv::Mat(cv::Matx33d(60, 0, 25, 0, 60, 40, 0, 0, 1));
+        result.distCoeffs = cv::Mat::zeros(1, 5, CV_64F);
+        Calibrator calibrator;
+        for (const int orientation: {5, 6})
+        {
+            const QString path = directory.filePath(QStringLiteral("orientation-%1.jpg").arg(orientation));
+            const QString destination = directory.filePath(QStringLiteral("orientation-%1.png").arg(orientation));
+            QByteArray contents = jpeg;
+            // APP1 EXIF 块只携带 Orientation，5 和 6 分别覆盖镜像转置与顺时针旋转。
+            QByteArray exif = QByteArray::fromHex("ffe1002245786966000049492a000800000001001201030001000000");
+            exif.append(static_cast<char>(orientation));
+            exif.append(7, '\0');
+            contents.insert(2, exif);
+            QFile file(path);
+            require(file.open(QIODevice::WriteOnly) && file.write(contents) == contents.size(),
+                "无法写入带 EXIF 方向的 JPEG");
+            file.close();
+
+            QImageReader reader(path);
+            reader.setAutoTransform(true);
+            const QImage expected = reader.read().convertToFormat(QImage::Format_RGB32);
+            require(expected.size() == result.imageSize, "测试 EXIF 方向块未生效");
+            const auto comparison = calibrator.undistortionPreview(path, result);
+            require(comparison.error.isEmpty() && comparison.original.size() == result.imageSize,
+                "图片对比未使用 EXIF 旋转后的分辨率");
+            const auto preview = calibrator.previewImage(path, result.options, result, true);
+            require(preview.size() == result.imageSize, "普通预览未应用 EXIF 方向");
+            const auto calibration = calibrator.calibrate({path}, result.options);
+            require(calibration.imageSize == result.imageSize, "标定尺寸未应用 EXIF 方向");
+            QString error;
+            require(calibrator.undistortImageFile(path, destination, result, &error),
+                "批量去畸变未使用 EXIF 旋转后的分辨率");
+            require(QImage(destination).convertToFormat(QImage::Format_RGB32) == expected,
+                "批量去畸变像素方向与 Qt 诊断图不一致");
+        }
+
+        if (QImageWriter::supportedImageFormats().contains(QByteArrayLiteral("tiff")))
+        {
+            const QString path = directory.filePath(QStringLiteral("oriented.tiff"));
+            const QString destination = directory.filePath(QStringLiteral("oriented.png"));
+            QImageWriter writer(path);
+            writer.setTransformation(QImageIOHandler::TransformationRotate90);
+            require(writer.write(original), "无法创建带方向标记的 TIFF");
+            QImageReader reader(path);
+            reader.setAutoTransform(true);
+            require(reader.transformation() == QImageIOHandler::TransformationRotate90,
+                "测试 TIFF 方向标记未生效");
+            const QImage expected = reader.read().convertToFormat(QImage::Format_RGB32);
+            require(expected.size() == original.size().transposed() && analyzeImageQuality(path).readable,
+                "带转置方向的非方形 TIFF 应能按旋转后的尺寸读取并通过质量预检");
+            result.imageSize = expected.size();
+            const auto comparison = calibrator.undistortionPreview(path, result);
+            require(comparison.error.isEmpty()
+                    && comparison.original.convertToFormat(QImage::Format_RGB32) == expected,
+                "去畸变对比重复应用了 TIFF 方向");
+            QString error;
+            require(calibrator.undistortImageFile(path, destination, result, &error),
+                "带方向标记的 TIFF 批量去畸变失败");
+            require(QImage(destination).convertToFormat(QImage::Format_RGB32) == expected,
+                "批量去畸变重复应用了 TIFF 方向");
+        }
+    }
 }
 
 int main(int argc, char **argv)
@@ -221,6 +367,10 @@ int main(int argc, char **argv)
     {
         testComparisonViews();
         testInvalidImages();
+        QTemporaryDir directory;
+        require(directory.isValid(), "无法创建图片对比测试目录");
+        testFisheyeSkew(directory);
+        testExifOrientation(directory);
         qInfo("图片对比行为测试通过");
         return EXIT_SUCCESS;
     }

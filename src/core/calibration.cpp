@@ -1,6 +1,10 @@
 #include "calibration.h"
+#include "image_io.h"
 
+#include <QByteArray>
 #include <QDateTime>
+#include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QIODevice>
 #include <QObject>
@@ -11,20 +15,107 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/objdetect.hpp>
+#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <exception>
 #include <iomanip>
 #include <limits>
 #include <locale>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace
 {
+    void writeParameterNode(cv::FileStorage &storage, const std::string &key,
+        const YAML::Node &node, std::vector<YAML::Node> &parents)
+    {
+        if (node.IsMap() || node.IsSequence())
+        {
+            if (std::any_of(parents.begin(), parents.end(),
+                    [&node](const YAML::Node &parent) { return node.is(parent); }))
+            {
+                throw std::invalid_argument("YAML 参数不能包含循环引用。");
+            }
+            parents.push_back(node);
+            const bool map = node.IsMap();
+            const bool opencvMatrix = node.Tag() == "tag:yaml.org,2002:opencv-matrix";
+            storage.startWriteStruct(key, map ? cv::FileNode::MAP : cv::FileNode::SEQ,
+                opencvMatrix ? "opencv-matrix" : "");
+            if (map)
+            {
+                for (const auto &entry: node)
+                {
+                    writeParameterNode(storage, entry.first.as<std::string>(), entry.second, parents);
+                }
+            }
+            else
+            {
+                for (const auto &entry: node)
+                {
+                    writeParameterNode(storage, {}, entry, parents);
+                }
+            }
+            storage.endWriteStruct();
+            parents.pop_back();
+            return;
+        }
+
+        const std::string &tag = node.Tag();
+        std::int64_t integer;
+        double number;
+        if ((tag == "?" || tag == "tag:yaml.org,2002:int")
+            && YAML::convert<std::int64_t>::decode(node, integer))
+        {
+            storage.write(key, integer);
+        }
+        else if ((tag == "?" || tag == "tag:yaml.org,2002:float")
+            && YAML::convert<double>::decode(node, number))
+        {
+            storage.write(key, number);
+        }
+        else
+        {
+            storage.write(key, node.IsScalar() ? node.Scalar() : std::string{});
+        }
+    }
+
+    cv::FileStorage openParameterStorage(const std::string &contents)
+    {
+        constexpr int readFlags = cv::FileStorage::READ | cv::FileStorage::MEMORY;
+        try
+        {
+            cv::FileStorage storage(contents, readFlags | cv::FileStorage::FORMAT_YAML);
+            if (storage.isOpened())
+            {
+                return storage;
+            }
+        }
+        catch (const cv::Exception &)
+        {
+            // OpenCV 读取自身的 YAML 格式，但不接受部分标准 YAML 序列和映射布局。
+        }
+
+        const YAML::Node root = YAML::Load(contents);
+        if (!root.IsMap())
+        {
+            throw std::invalid_argument("YAML 参数须为映射。");
+        }
+        cv::FileStorage normalized(".json",
+            cv::FileStorage::WRITE | cv::FileStorage::MEMORY | cv::FileStorage::FORMAT_JSON);
+        std::vector<YAML::Node> parents{root};
+        for (const auto &entry: root)
+        {
+            writeParameterNode(normalized, entry.first.as<std::string>(), entry.second, parents);
+        }
+        return cv::FileStorage(normalized.releaseAndGetString(), readFlags);
+    }
+
     bool detectCorners(const cv::Mat &gray, const cv::Size &pattern,
         CalibrationMethod method,
         std::vector<cv::Point2f> &corners)
@@ -161,42 +252,115 @@ namespace
                 QObject::tr("Chessboard / 扇区法");
     }
 
-    bool parseCameraMatrix(const cv::FileNode &node, cv::Mat &matrix)
+    bool readNumericSequence(const cv::FileNode &node, double *output, size_t count)
     {
-        if (!node.isSeq() || node.size() != 3)
+        if (!node.isSeq() || node.size() != count)
         {
             return false;
         }
-        matrix = cv::Mat::zeros(3, 3, CV_64F);
-        for (int row = 0; row < 3; ++row)
+        for (const cv::FileNode value: node)
         {
-            const cv::FileNode values = node[static_cast<size_t>(row)];
-            if (!values.isSeq() || values.size() != 3)
+            if (!value.isInt() && !value.isReal())
             {
                 return false;
             }
-            for (int col = 0; col < 3; ++col)
+            value >> *output;
+            ++output;
+        }
+        return true;
+    }
+
+    bool readMatrix(const cv::FileNode &node, int rows, int cols, cv::Mat &matrix)
+    {
+        if (node.isMap())
+        {
+            cv::Mat input;
+            node >> input;
+            if (input.rows != rows || input.cols != cols || input.channels() != 1)
             {
-                const cv::FileNode value = values[static_cast<size_t>(col)];
-                if (!value.isInt() && !value.isReal())
-                {
-                    return false;
-                }
-                value >> matrix.at<double>(row, col);
+                return false;
+            }
+            input.convertTo(matrix, CV_64F);
+            return true;
+        }
+        if (!node.isSeq() || node.size() == 0)
+        {
+            return false;
+        }
+        matrix.create(rows, cols, CV_64F);
+        if (!node[0].isSeq())
+        {
+            return readNumericSequence(node, matrix.ptr<double>(), matrix.total());
+        }
+        if (node.size() != static_cast<size_t>(rows))
+        {
+            return false;
+        }
+        for (int row = 0; row < rows; ++row)
+        {
+            if (!readNumericSequence(node[row], matrix.ptr<double>(row), static_cast<size_t>(cols)))
+            {
+                return false;
             }
         }
         return true;
     }
 
     template<typename T>
-    void readRequired(const cv::FileStorage &storage, const char *key, T &value)
+    void readRequired(const cv::FileNode &node, const char *key, T &value)
     {
-        const cv::FileNode node = storage[key];
         if (node.empty())
         {
             throw std::invalid_argument(std::string("缺少必需参数：") + key);
         }
+        bool validType;
+        if constexpr (std::is_same_v<T, int>)
+        {
+            validType = node.isInt();
+        }
+        else if constexpr (std::is_same_v<T, double>)
+        {
+            validType = node.isInt() || node.isReal();
+        }
+        else
+        {
+            validType = node.isString();
+        }
+        if (!validType)
+        {
+            throw std::invalid_argument(std::string("参数类型无效：") + key);
+        }
         node >> value;
+    }
+
+    std::vector<CalibrationPose> readParameterPoses(const cv::FileNode &node,
+        const QDir &directory)
+    {
+        if (!node.isSeq())
+        {
+            throw std::invalid_argument("poses 必须为列表。");
+        }
+        std::vector<CalibrationPose> poses;
+        poses.reserve(node.size());
+        for (const cv::FileNode entry: node)
+        {
+            CalibrationPose pose;
+            cv::String image;
+            readRequired(entry["image"], "poses.image", image);
+            readRequired(entry["reprojection_error"], "poses.reprojection_error",
+                pose.reprojectionError);
+            if (image.empty() || !std::isfinite(pose.reprojectionError)
+                || pose.reprojectionError < 0.0
+                || !readNumericSequence(entry["rotation_vector"], pose.rotationVector.val, 3)
+                || !readNumericSequence(entry["translation_vector"], pose.translationVector.val, 3)
+                || !cv::checkRange(pose.rotationVector) || !cv::checkRange(pose.translationVector))
+            {
+                throw std::invalid_argument("poses 中的图片、旋转、平移或重投影误差无效。");
+            }
+            pose.imagePath = QDir::cleanPath(directory.absoluteFilePath(QString::fromStdString(image)));
+            poses.push_back(std::move(pose));
+        }
+        return poses;
     }
 
     ArucoDictionary parseDictionaryName(const cv::String &name)
@@ -236,15 +400,18 @@ namespace
         {
             return QObject::tr("相机模型或径向系数数量无效。");
         }
-        if (opts.boardSize.width() < 2 || opts.boardSize.height() < 2)
+        const bool isCharuco = opts.boardType == CalibrationBoardType::Charuco;
+        const int minimumSquares = isCharuco ? 2 : 4;
+        if (opts.boardSize.width() < minimumSquares || opts.boardSize.height() < minimumSquares)
         {
-            return QObject::tr("标定板每个方向至少需要 2 个方格。");
+            return isCharuco ? QObject::tr("ChArUco 板每个方向至少需要 2 个方格。")
+                : QObject::tr("普通棋盘格每个方向至少需要 4 个方格（3 个内部角点）。");
         }
         if (!std::isfinite(opts.squareSize) || !(opts.squareSize > 0.0))
         {
             return QObject::tr("方格尺寸必须大于 0。");
         }
-        if (opts.boardType == CalibrationBoardType::Charuco)
+        if (isCharuco)
         {
             if (!(opts.markerSize > 0.0 && opts.markerSize < opts.squareSize))
             {
@@ -465,6 +632,36 @@ namespace
             image, pattern, detection.imagePoints, detection.usable);
     }
 
+    cv::Mat undistortImage(const cv::Mat &input, const CalibrationResult &result)
+    {
+        cv::Mat output;
+        const cv::Mat &matrix = result.cameraMatrix;
+        const cv::Mat &distortion = result.distCoeffs;
+        if (result.options.cameraModel == CameraModel::Pinhole)
+        {
+            cv::undistort(input, output, matrix, distortion);
+            return output;
+        }
+
+        cv::Mat intrinsic;
+        matrix.convertTo(intrinsic, CV_64F);
+        const double skew = intrinsic.at<double>(0, 1);
+        if (skew == 0.0)
+        {
+            cv::fisheye::undistortImage(input, output, matrix, distortion, matrix, input.size());
+            return output;
+        }
+
+        cv::Mat mapX;
+        cv::Mat mapY;
+        cv::fisheye::initUndistortRectifyMap(matrix, distortion, cv::noArray(),
+            matrix, input.size(), CV_32FC1, mapX, mapY);
+        // OpenCV 的映射只在目标内参中使用 skew，源投影还需加上 K(0,1) * y_distorted。
+        mapX += (mapY - intrinsic.at<double>(1, 2)) * (skew / intrinsic.at<double>(1, 1));
+        cv::remap(input, output, mapX, mapY, cv::INTER_LINEAR);
+        return output;
+    }
+
     QImage matToQImage(const cv::Mat &in)
     {
         if (in.empty())
@@ -627,8 +824,7 @@ QImage Calibrator::previewImage(const QString &filePath,
         if (!cacheHit)
         {
             // 文件元数据和检测选项共同构成缓存键，覆盖磁盘替换与参数调整两类失效
-            cv::Mat image =
-                    cv::imread(filePath.toStdString(), cv::IMREAD_COLOR);
+            cv::Mat image = readOrientedImage(filePath, cv::IMREAD_COLOR);
             if (image.empty())
             {
                 previewCacheAnnotated_.release();
@@ -702,19 +898,7 @@ QImage Calibrator::previewImage(const QString &filePath,
         if (showUndistorted && calib.success && matchingResolution)
         {
             // 校正只写入显示副本，保留缓存中的原图以便快速切换显示模式
-            cv::Mat tmp;
-            if (calib.options.cameraModel == CameraModel::Fisheye)
-            {
-                cv::fisheye::undistortImage(
-                    display, tmp, calib.cameraMatrix, calib.distCoeffs,
-                    calib.cameraMatrix, display.size());
-            }
-            else
-            {
-                cv::undistort(
-                    display, tmp, calib.cameraMatrix, calib.distCoeffs);
-            }
-            display = tmp;
+            display = undistortImage(display, calib);
         }
 
         return matToQImage(display);
@@ -749,7 +933,7 @@ UndistortionPreview Calibrator::undistortionPreview(const QString &filePath,
     UndistortionPreview preview;
     try
     {
-        const cv::Mat input = cv::imread(filePath.toStdString(), cv::IMREAD_COLOR);
+        const cv::Mat input = readOrientedImage(filePath, cv::IMREAD_COLOR);
         if (input.empty())
         {
             preview.error = QObject::tr("无法读取输入图片。");
@@ -780,16 +964,7 @@ UndistortionPreview Calibrator::undistortionPreview(const QString &filePath,
                     .arg(result.imageSize.width()).arg(result.imageSize.height());
             return preview;
         }
-        cv::Mat output;
-        if (result.options.cameraModel == CameraModel::Fisheye)
-        {
-            cv::fisheye::undistortImage(input, output, matrix, distortion, matrix, input.size());
-        }
-        else
-        {
-            cv::undistort(input, output, matrix, distortion);
-        }
-        preview.undistorted = matToQImage(output);
+        preview.undistorted = matToQImage(undistortImage(input, result));
         if (preview.undistorted.isNull())
         {
             preview.error = QObject::tr("无法生成去畸变预览。");
@@ -854,7 +1029,7 @@ CalibrationResult Calibrator::calibrate(const QStringList &files,
                     ? QSize(imageSize.width, imageSize.height) : QSize();
             try
             {
-                const cv::Mat img = cv::imread(files[i].toStdString(), cv::IMREAD_COLOR);
+                const cv::Mat img = readOrientedImage(files[i], cv::IMREAD_COLOR);
                 if (img.empty())
                 {
                     imageReport.status = ImageDetectionStatus::ReadFailed;
@@ -1138,41 +1313,33 @@ bool Calibrator::exportParameters(const QString &filePath,
         }
 
         const CalibrationOptions &opts = result.options;
+        const auto writeMetadata = [&](const char *key, const auto &value, bool applicable = true)
+        {
+            if (result.importedMetadataFields ? result.hasMetadata(QString::fromLatin1(key)) : applicable)
+            {
+                storage << key << value;
+            }
+        };
         storage << "format_version" << 3;
         storage << "camera_model" << cameraModelName(opts.cameraModel);
         storage << "image_width" << result.imageSize.width();
         storage << "image_height" << result.imageSize.height();
-        storage << "board_type" << boardTypeName(opts.boardType);
-        storage << "board_columns" << opts.boardSize.width();
-        storage << "board_rows" << opts.boardSize.height();
-        storage << "square_size_mm" << opts.squareSize;
-        if (opts.boardType == CalibrationBoardType::Charuco)
-        {
-            storage << "marker_size_mm" << opts.markerSize;
-            storage << "aruco_dictionary"
-                    << dictionaryName(opts.dictionary);
-        }
-        else
-        {
-            storage << "corner_detection_method"
-                    << detectionMethodName(opts.method);
-        }
-        if (opts.cameraModel == CameraModel::Fisheye)
-        {
-            storage << "estimate_skew"
-                    << static_cast<int>(opts.skew);
-        }
-        else
-        {
-            storage << "estimate_tangential_distortion"
-                    << static_cast<int>(opts.tangential);
-        }
-        storage << "radial_coefficients" << opts.radialCoeffs;
-        storage << "rms_reprojection_error" << result.rmsError;
-        storage << "quality_warning"
-                << static_cast<int>(result.qualityWarning);
-        storage << "images_used" << result.imagesUsed;
-        storage << "images_total" << result.imagesTotal;
+        writeMetadata("board_type", boardTypeName(opts.boardType));
+        writeMetadata("board_columns", opts.boardSize.width());
+        writeMetadata("board_rows", opts.boardSize.height());
+        writeMetadata("square_size_mm", opts.squareSize);
+        const bool isCharuco = opts.boardType == CalibrationBoardType::Charuco;
+        writeMetadata("marker_size_mm", opts.markerSize, isCharuco);
+        writeMetadata("aruco_dictionary", dictionaryName(opts.dictionary), isCharuco);
+        writeMetadata("corner_detection_method", detectionMethodName(opts.method), !isCharuco);
+        const bool isFisheye = opts.cameraModel == CameraModel::Fisheye;
+        writeMetadata("estimate_skew", static_cast<int>(opts.skew), isFisheye);
+        writeMetadata("estimate_tangential_distortion", static_cast<int>(opts.tangential), !isFisheye);
+        writeMetadata("radial_coefficients", opts.radialCoeffs);
+        writeMetadata("rms_reprojection_error", result.rmsError);
+        writeMetadata("quality_warning", static_cast<int>(result.qualityWarning));
+        writeMetadata("images_used", result.imagesUsed);
+        writeMetadata("images_total", result.imagesTotal);
         cv::Mat cameraMatrix;
         result.cameraMatrix.convertTo(cameraMatrix, CV_64F);
         storage.startWriteStruct("camera_matrix", cv::FileNode::SEQ);
@@ -1193,24 +1360,29 @@ bool Calibrator::exportParameters(const QString &filePath,
 
         // FileStorage 先写占位键，释放字符串后再替换为兼容 OpenCV 的矩阵块
         storage << "distortion_coefficients" << 0;
-        storage << "poses" << "[";
-        for (const CalibrationPose &pose: result.poses)
+        if (result.hasMetadata(QStringLiteral("poses")) || !result.poses.empty())
         {
-            storage << "{"
-                    << "image"
-                    << QFileInfo(pose.imagePath).fileName().toStdString()
-                    << "rotation_vector" << "["
-                    << pose.rotationVector[0]
-                    << pose.rotationVector[1]
-                    << pose.rotationVector[2] << "]"
-                    << "translation_vector" << "["
-                    << pose.translationVector[0]
-                    << pose.translationVector[1]
-                    << pose.translationVector[2] << "]"
-                    << "reprojection_error" << pose.reprojectionError
-                    << "}";
+            const QDir outputDirectory = QFileInfo(filePath).absoluteDir();
+            storage << "poses" << "[";
+            for (const CalibrationPose &pose: result.poses)
+            {
+                storage << "{";
+                storage.write("image",
+                    outputDirectory.relativeFilePath(pose.imagePath).toStdString());
+                storage
+                        << "rotation_vector" << "["
+                        << pose.rotationVector[0]
+                        << pose.rotationVector[1]
+                        << pose.rotationVector[2] << "]"
+                        << "translation_vector" << "["
+                        << pose.translationVector[0]
+                        << pose.translationVector[1]
+                        << pose.translationVector[2] << "]"
+                        << "reprojection_error" << pose.reprojectionError
+                        << "}";
+            }
+            storage << "]";
         }
-        storage << "]";
 
         cv::String yaml = storage.releaseAndGetString();
         std::ostringstream distortionBlock;
@@ -1303,7 +1475,16 @@ std::optional<CalibrationResult> Calibrator::importParameters(
     }
     try
     {
-        cv::FileStorage storage(filePath.toStdString(), cv::FileStorage::READ);
+        QFile input(filePath);
+        if (!input.open(QIODevice::ReadOnly))
+        {
+            if (error)
+            {
+                *error = QObject::tr("无法打开参数文件：%1").arg(input.errorString());
+            }
+            return std::nullopt;
+        }
+        const cv::FileStorage storage = openParameterStorage(input.readAll().toStdString());
         if (!storage.isOpened())
         {
             if (error)
@@ -1313,16 +1494,27 @@ std::optional<CalibrationResult> Calibrator::importParameters(
             return std::nullopt;
         }
 
-        int version = 0;
-        readRequired(storage, "format_version", version);
-        if (version != 3)
+        const cv::FileNode version = storage["format_version"];
+        if (!version.empty() && (!version.isInt() || static_cast<int>(version) != 3))
         {
             if (error) *error = QObject::tr("仅支持 format_version 为 3 的参数文件。");
             return std::nullopt;
         }
         CalibrationResult result;
+        result.importedMetadataFields.emplace();
+        const auto readOptional = [&](const char *key, auto &value)
+        {
+            const cv::FileNode node = storage[key];
+            if (node.empty())
+            {
+                return false;
+            }
+            readRequired(node, key, value);
+            result.importedMetadataFields->insert(QString::fromLatin1(key));
+            return true;
+        };
         cv::String cameraModel;
-        readRequired(storage, "camera_model", cameraModel);
+        readRequired(storage["camera_model"], "camera_model", cameraModel);
         if (cameraModel == "pinhole")
         {
             result.options.cameraModel = CameraModel::Pinhole;
@@ -1336,8 +1528,7 @@ std::optional<CalibrationResult> Calibrator::importParameters(
             if (error) *error = QObject::tr("未知的 camera_model。");
             return std::nullopt;
         }
-        if (!parseCameraMatrix(storage["camera_matrix"],
-            result.cameraMatrix))
+        if (!readMatrix(storage["camera_matrix"], 3, 3, result.cameraMatrix))
         {
             if (error)
             {
@@ -1346,27 +1537,20 @@ std::optional<CalibrationResult> Calibrator::importParameters(
             return std::nullopt;
         }
         const cv::FileNode distortion = storage["distortion_coefficients"];
-        if (!distortion.isMap())
-        {
-            if (error) *error = QObject::tr("distortion_coefficients 必须是 1×N OpenCV 矩阵。");
-            return std::nullopt;
-        }
-        distortion >> result.distCoeffs;
-        if (result.distCoeffs.empty() || result.distCoeffs.rows != 1
-            || result.distCoeffs.channels() != 1)
+        const int coefficientCount = static_cast<int>(distortionCoefficientCount(result.options.cameraModel));
+        if (!readMatrix(distortion, 1, coefficientCount, result.distCoeffs)
+            && !readMatrix(distortion, coefficientCount, 1, result.distCoeffs))
         {
             if (error)
             {
-                *error = QObject::tr("distortion_coefficients 无效。");
+                *error = QObject::tr("distortion_coefficients 必须包含与相机模型匹配的 %1 个系数。")
+                    .arg(coefficientCount);
             }
             return std::nullopt;
         }
-        result.distCoeffs.convertTo(result.distCoeffs, CV_64F);
+        result.distCoeffs = result.distCoeffs.reshape(1, 1);
 
-        const size_t expectedCount = distortionCoefficientCount(result.options.cameraModel);
-        // 当前文件契约不接受与模型不匹配的可变长度畸变向量
-        if (result.distCoeffs.total() != expectedCount
-            || !cv::checkRange(result.cameraMatrix)
+        if (!cv::checkRange(result.cameraMatrix)
             || !cv::checkRange(result.distCoeffs)
             || result.cameraMatrix.at<double>(0, 0) <= 0.0
             || result.cameraMatrix.at<double>(1, 1) <= 0.0
@@ -1384,8 +1568,8 @@ std::optional<CalibrationResult> Calibrator::importParameters(
 
         int imageWidth = 0;
         int imageHeight = 0;
-        readRequired(storage, "image_width", imageWidth);
-        readRequired(storage, "image_height", imageHeight);
+        readRequired(storage["image_width"], "image_width", imageWidth);
+        readRequired(storage["image_height"], "image_height", imageHeight);
         if (imageWidth <= 0 || imageHeight <= 0)
         {
             if (error)
@@ -1396,82 +1580,125 @@ std::optional<CalibrationResult> Calibrator::importParameters(
         }
         result.imageSize = {imageWidth, imageHeight};
 
+        CalibrationOptions &options = result.options;
         cv::String boardType;
-        readRequired(storage, "board_type", boardType);
-        if (boardType != "chess" && boardType != "charuco")
+        if (readOptional("board_type", boardType))
         {
-            if (error) *error = QObject::tr("未知的 board_type。");
-            return std::nullopt;
+            if (boardType != "chess" && boardType != "charuco")
+            {
+                throw std::invalid_argument("未知的 board_type。");
+            }
+            options.boardType = boardType == "chess" ?
+                    CalibrationBoardType::Chessboard : CalibrationBoardType::Charuco;
         }
-        result.options.boardType = boardType == "chess" ?
-                CalibrationBoardType::Chessboard : CalibrationBoardType::Charuco;
-        int boardColumns = 0;
-        int boardRows = 0;
-        readRequired(storage, "board_columns", boardColumns);
-        readRequired(storage, "board_rows", boardRows);
-        result.options.boardSize = {boardColumns, boardRows};
-        readRequired(storage, "square_size_mm", result.options.squareSize);
-        if (result.options.boardType == CalibrationBoardType::Charuco)
+        int boardColumns = options.boardSize.width();
+        int boardRows = options.boardSize.height();
+        const bool hasColumns = readOptional("board_columns", boardColumns);
+        const bool hasRows = readOptional("board_rows", boardRows);
+        options.boardSize = {boardColumns, boardRows};
+        const bool hasSquareSize = readOptional("square_size_mm", options.squareSize);
+        const bool hasMarkerSize = readOptional("marker_size_mm", options.markerSize);
+        cv::String dictionary;
+        const bool hasDictionary = readOptional("aruco_dictionary", dictionary);
+        if (hasDictionary)
         {
-            readRequired(storage, "marker_size_mm", result.options.markerSize);
-            cv::String dictionary;
-            readRequired(storage, "aruco_dictionary", dictionary);
-            result.options.dictionary = parseDictionaryName(dictionary);
+            options.dictionary = parseDictionaryName(dictionary);
         }
-        else
+        cv::String method;
+        if (readOptional("corner_detection_method", method))
         {
-            cv::String method;
-            readRequired(storage, "corner_detection_method", method);
             if (method != "findChessboardCorners" && method != "findChessboardCornersSB")
             {
-                if (error) *error = QObject::tr("未知的 corner_detection_method。");
-                return std::nullopt;
+                throw std::invalid_argument("未知的 corner_detection_method。");
             }
-            result.options.method = method == "findChessboardCornersSB" ?
+            options.method = method == "findChessboardCornersSB" ?
                     CalibrationMethod::SectorBased :
                     CalibrationMethod::Classic;
         }
-        int flag = 0;
-        if (result.options.cameraModel == CameraModel::Fisheye)
+
+        const auto readFlag = [&](const char *key, bool &field)
         {
-            readRequired(storage, "estimate_skew", flag);
-            if (flag != 0 && flag != 1) throw std::invalid_argument("estimate_skew 必须为 0 或 1。");
-            result.options.skew = flag != 0;
-        }
-        else
-        {
-            readRequired(storage, "estimate_tangential_distortion", flag);
-            if (flag != 0 && flag != 1) throw std::invalid_argument("estimate_tangential_distortion 必须为 0 或 1。");
-            result.options.tangential = flag != 0;
-        }
-        readRequired(storage, "radial_coefficients",
-            result.options.radialCoeffs);
-        readRequired(storage, "rms_reprojection_error", result.rmsError);
-        flag = 0;
-        readRequired(storage, "quality_warning", flag);
-        if (flag != 0 && flag != 1) throw std::invalid_argument("quality_warning 必须为 0 或 1。");
-        result.qualityWarning = flag != 0;
-        readRequired(storage, "images_used", result.imagesUsed);
-        readRequired(storage, "images_total", result.imagesTotal);
-        if (!validateOptions(result.options).isEmpty()
-            || !std::isfinite(result.rmsError) || result.rmsError < 0.0
-            || result.imagesUsed < 0 || result.imagesTotal < result.imagesUsed
-            || !storage["poses"].isSeq())
-        {
-            if (error)
+            int flag = 0;
+            if (readOptional(key, flag))
             {
-                *error = QObject::tr("参数文件中的标定选项或 RMS 数值无效。");
+                if (flag != 0 && flag != 1)
+                {
+                    throw std::invalid_argument(std::string(key) + " 必须为 0 或 1。");
+                }
+                field = flag != 0;
             }
-            return std::nullopt;
+        };
+        readFlag("estimate_skew", options.skew);
+        readFlag("estimate_tangential_distortion", options.tangential);
+        readFlag("quality_warning", result.qualityWarning);
+        readOptional("radial_coefficients", options.radialCoeffs);
+        const bool hasRms = readOptional("rms_reprojection_error", result.rmsError);
+        const bool hasUsed = readOptional("images_used", result.imagesUsed);
+        const bool hasTotal = readOptional("images_total", result.imagesTotal);
+
+        if (boardColumns < 2 || boardRows < 2
+            || !std::isfinite(options.squareSize) || options.squareSize <= 0.0
+            || !std::isfinite(options.markerSize) || options.markerSize <= 0.0
+            || options.radialCoeffs < 2
+            || options.radialCoeffs > maximumRadialCoefficients(options.cameraModel))
+        {
+            throw std::invalid_argument("参数文件中的标定选项无效。");
         }
-        result.sourceDirectory = QFileInfo(filePath).absolutePath();
+        if (options.boardType == CalibrationBoardType::Charuco)
+        {
+            if (options.markerSize >= options.squareSize)
+            {
+                if (hasMarkerSize && hasSquareSize)
+                {
+                    throw std::invalid_argument("ChArUco 标记尺寸必须小于方格尺寸。");
+                }
+                // 保持缺省的标定板配置可用，导出时仍只写入原文件提供的字段。
+                if (hasSquareSize)
+                {
+                    options.markerSize = options.squareSize * 0.75;
+                }
+                else
+                {
+                    options.squareSize = options.markerSize / 0.75;
+                }
+            }
+            if (hasColumns && hasRows && hasDictionary
+                && static_cast<qint64>(boardColumns) * boardRows
+                    > 2 * dictionaryCapacity(options.dictionary))
+            {
+                throw std::invalid_argument("ChArUco 字典无法为指定板尺寸提供足够的标记。");
+            }
+        }
+        if (!std::isfinite(result.rmsError) || result.rmsError < 0.0
+            || result.imagesUsed < 0 || result.imagesTotal < 0
+            || (hasUsed && hasTotal && result.imagesTotal < result.imagesUsed))
+        {
+            throw std::invalid_argument("参数文件中的 RMS 或图片数量无效。");
+        }
+        const QDir directory = QFileInfo(filePath).absoluteDir();
+        const cv::FileNode poses = storage["poses"];
+        if (!poses.empty())
+        {
+            result.poses = readParameterPoses(poses, directory);
+            if (hasUsed && result.poses.size() > static_cast<size_t>(result.imagesUsed))
+            {
+                throw std::invalid_argument("poses 数量超过 images_used。");
+            }
+            if (hasTotal && result.poses.size() > static_cast<size_t>(result.imagesTotal))
+            {
+                throw std::invalid_argument("poses 数量超过 images_total。");
+            }
+            result.importedMetadataFields->insert(QStringLiteral("poses"));
+        }
+        result.sourceDirectory = directory.absolutePath();
         result.success = true;
         result.report = QObject::tr(
-                    "已导入相机参数。\n相机模型：%1\n图像尺寸：%2 × %3\nRMS：%4 px")
+                    "已导入相机参数。\n相机模型：%1\n图像尺寸：%2 × %3\nRMS：%4")
                 .arg(cameraModelDisplayName(result.options.cameraModel))
                 .arg(imageWidth)
                 .arg(imageHeight)
-                .arg(result.rmsError, 0, 'f', 3);
+                .arg(hasRms ? QObject::tr("%1 px").arg(result.rmsError, 0, 'f', 3)
+                    : QObject::tr("未提供"));
         return result;
     }
     catch (const cv::Exception &exception)
@@ -1519,8 +1746,7 @@ bool Calibrator::undistortImageFile(const QString &inputPath,
     }
     try
     {
-        const cv::Mat input =
-                cv::imread(inputPath.toStdString(), cv::IMREAD_UNCHANGED);
+        const cv::Mat input = readOrientedImage(inputPath, cv::IMREAD_UNCHANGED);
         if (input.empty())
         {
             if (error)
@@ -1542,18 +1768,7 @@ bool Calibrator::undistortImageFile(const QString &inputPath,
             }
             return false;
         }
-        cv::Mat output;
-        if (result.options.cameraModel == CameraModel::Fisheye)
-        {
-            cv::fisheye::undistortImage(
-                input, output, result.cameraMatrix, result.distCoeffs,
-                result.cameraMatrix, input.size());
-        }
-        else
-        {
-            cv::undistort(input, output, result.cameraMatrix,
-                result.distCoeffs);
-        }
+        const cv::Mat output = undistortImage(input, result);
         if (!cv::imwrite(outputPath.toStdString(), output))
         {
             if (error)

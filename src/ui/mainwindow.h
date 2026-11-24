@@ -19,6 +19,8 @@ class QCheckBox;
 class QCloseEvent;
 class QComboBox;
 class QDoubleSpinBox;
+class QDragEnterEvent;
+class QDropEvent;
 class QLabel;
 class QListWidget;
 class QListWidgetItem;
@@ -75,6 +77,10 @@ protected:
     void resizeEvent(QResizeEvent *event) override;
 
     void closeEvent(QCloseEvent *event) override;
+
+    void dragEnterEvent(QDragEnterEvent *event) override;
+
+    void dropEvent(QDropEvent *event) override;
 
 private
 
@@ -248,6 +254,7 @@ private:
     {
         int written = 0; ///< 成功输出的文件数
         int skipped = 0; ///< 未能输出的文件数
+        bool canceled = false;
         QStringList errors; ///< 各失败文件的诊断信息
     };
 

@@ -4,26 +4,33 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QBuffer>
 #include <QCheckBox>
 #include <QColor>
 #include <QComboBox>
 #include <QDebug>
 #include <QDialog>
+#include <QDir>
+#include <QDragEnterEvent>
+#include <QDropEvent>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFile>
 #include <QEventLoop>
 #include <QImage>
+#include <QLabel>
 #include <QListWidget>
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QMetaObject>
+#include <QMimeData>
 #include <QPushButton>
 #include <QSpinBox>
 #include <QStringList>
 #include <QTableWidget>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QUrl>
 #include <QWidget>
 
 #include <opencv2/core.hpp>
@@ -120,6 +127,56 @@ namespace
         require(!child<QPushButton>(emptyDialog,
                     "applyComparisonResultButton")->isEnabled(),
             "空候选列表不应允许应用");
+    }
+
+    void testDropImagesAndFolders()
+    {
+        QTemporaryDir directory;
+        require(directory.isValid() && QDir(directory.path()).mkpath("folder/nested"),
+            "无法建立拖放测试目录");
+        QImage image(64, 64, QImage::Format_RGB32);
+        image.fill(Qt::gray);
+        for (const QString &name: QStringList{"single.png", "folder/b.png",
+                 "folder/a.PNG", "folder/nested/ignored.png"})
+        {
+            require(image.save(directory.filePath(name)), "无法保存拖放测试图片");
+        }
+        QFile other(directory.filePath("notes.txt"));
+        require(other.open(QIODevice::WriteOnly), "无法建立非图片文件");
+        other.close();
+
+        MainWindow window;
+        window.show();
+        auto *preview = child<QWidget>(window, "imageDisplay");
+        const QUrl textFile = QUrl::fromLocalFile(other.fileName());
+        const QUrl remote(QStringLiteral("https://example.invalid/photo.png"));
+        QMimeData data;
+        data.setUrls({textFile, remote});
+#if QT_VERSION >= QT_VERSION_CHECK(6, 12, 0)
+        const QPointF position(5, 5);
+#else
+        const QPoint position(5, 5);
+#endif
+        QDragEnterEvent unsupported(position, Qt::CopyAction, &data,
+            Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(preview, &unsupported);
+        require(!unsupported.isAccepted(), "不支持的拖放内容不应被接受");
+
+        data.setUrls({QUrl::fromLocalFile(directory.filePath("single.png")),
+            QUrl::fromLocalFile(directory.filePath("folder")),
+            QUrl::fromLocalFile(directory.filePath("folder/b.png")), textFile, remote});
+        QDragEnterEvent enter(position, Qt::CopyAction, &data,
+            Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(preview, &enter);
+        require(enter.isAccepted(), "预览区未接受图片和文件夹混合拖入");
+        QDropEvent drop(position, Qt::CopyAction, &data, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(preview, &drop);
+        auto *list = child<QListWidget>(window, "imageList");
+        require(drop.isAccepted() && list->count() == 3
+                && list->item(0)->text().startsWith("single.png")
+                && list->item(1)->text().startsWith("a.PNG")
+                && list->item(2)->text().startsWith("b.png"),
+            "拖入图片与文件夹后的列表内容、去重或排序错误");
     }
 
     void testImageParticipationAndFilters()
@@ -242,6 +299,106 @@ namespace
             "修改标定参数后旧结果未失效");
         require(!child<QAction>(window, "undistortionComparisonAction")->isEnabled(),
             "修改参数后旧结果不应继续用于对比预览");
+
+        auto *boardRows = child<QSpinBox>(window, "boardRowsSpin");
+        auto *boardType = child<QComboBox>(window, "boardTypeCombo");
+        require(boardColumns->minimum() == 4 && boardRows->minimum() == 4,
+            "普通棋盘应至少有 4×4 个方格");
+        boardType->setCurrentIndex(boardType->findData(static_cast<int>(CalibrationBoardType::Charuco)));
+        require(boardColumns->minimum() == 2 && boardRows->minimum() == 2,
+            "ChArUco 应保留 2×2 方格选项");
+    }
+
+    void testImportParameters()
+    {
+        QTemporaryDir directory;
+        require(directory.isValid(), "无法建立参数导入测试目录");
+        const QString path = directory.filePath("parameters.yaml");
+        QFile parameters(path);
+        const QByteArray contents =
+            "camera_model: pinhole\n"
+            "image_width: 320\n"
+            "image_height: 240\n"
+            "camera_matrix: [[500, 0, 160], [0, 500, 120], [0, 0, 1]]\n"
+            "distortion_coefficients: [1, 0, 0, 0, 0]\n"
+            "poses:\n"
+            "  - image: board.png\n"
+            "    rotation_vector: [0.1, 0.2, 0.3]\n"
+            "    translation_vector: [10, 20, 500]\n"
+            "    reprojection_error: 0.75\n";
+        require(parameters.open(QIODevice::WriteOnly)
+                && parameters.write(contents) == contents.size(), "无法写入参数测试文件");
+        parameters.close();
+
+        QImage image(240, 320, QImage::Format_RGB32);
+        image.fill(Qt::white);
+        QByteArray jpeg;
+        QBuffer buffer(&jpeg);
+        require(buffer.open(QIODevice::WriteOnly) && image.save(&buffer, "JPEG"),
+            "无法编码 JPEG 测试图片");
+        buffer.close();
+        // EXIF 方向 6 将保存的 240×320 图像顺时针旋转为 320×240。
+        jpeg.insert(2, QByteArray::fromHex(
+            "ffe1002245786966000049492a0008000000010012010300010000000600000000000000"));
+        QFile rotated(directory.filePath("rotated.jpg"));
+        require(rotated.open(QIODevice::WriteOnly) && rotated.write(jpeg) == jpeg.size(),
+            "无法写入带 EXIF 方向的 JPEG");
+        rotated.close();
+
+        MainWindow window;
+        window.loadImages({rotated.fileName()});
+        auto *list = child<QListWidget>(window, "imageList");
+        list->setCurrentRow(0);
+        bool resolutionWarning = false;
+        QTimer driver;
+        QObject::connect(&driver, &QTimer::timeout, &window, [&]
+        {
+            for (QWidget *widget: QApplication::topLevelWidgets())
+            {
+                if (auto *file = qobject_cast<QFileDialog *>(widget); file && file->isVisible())
+                {
+                    file->setDirectory(directory.path());
+                    child<QLineEdit>(*file, "fileNameEdit")->setText(path);
+                    QMetaObject::invokeMethod(file, "accept", Qt::QueuedConnection);
+                }
+                else if (auto *message = qobject_cast<QMessageBox *>(widget);
+                    message && message->isVisible())
+                {
+                    if (message->objectName() == QStringLiteral("unsavedChangesDialog"))
+                    {
+                        message->button(QMessageBox::Discard)->click();
+                    }
+                    else
+                    {
+                        resolutionWarning |= message->windowTitle() == QStringLiteral("分辨率不一致");
+                        message->accept();
+                    }
+                }
+            }
+        });
+        driver.start(10);
+        child<QAction>(window, "importParametersAction")->trigger();
+        driver.stop();
+
+        require(!resolutionWarning, "带方向标记的 JPEG 已匹配标定分辨率，不应提示冲突");
+        auto *preview = child<QLabel>(window, "imageDisplay");
+        const QImage original = preview->pixmap().toImage();
+        child<QCheckBox>(window, "showUndistortedCheck")->setChecked(true);
+        require(QMetaObject::invokeMethod(&window, "onImageSelectionChanged", Qt::DirectConnection)
+            && !original.isNull() && !preview->pixmap().isNull()
+            && preview->pixmap().toImage() != original,
+            "去畸变预览应使用 EXIF 旋转后的尺寸");
+
+        require(child<QLabel>(window, "resultRmsValue")->text() == QStringLiteral("未提供"),
+            "导入文件缺少 RMS 时应显示未提供");
+        auto *poseAction = child<QAction>(window, "poseResultAction");
+        require(poseAction->isEnabled()
+                && !child<QAction>(window, "calibrationDiagnosticsAction")->isEnabled(),
+            "导入位姿应可查看且无需逐角点诊断数据");
+        poseAction->trigger();
+        auto *table = child<QTableWidget>(window, "poseTable");
+        require(table->rowCount() == 1 && table->item(0, 1)->text() == QStringLiteral("board.png"),
+            "位姿窗口未显示导入的图片位姿");
     }
 
     void testSessionRestoration()
@@ -359,6 +516,65 @@ namespace
             "改变图片参与状态后诊断和对比应一起失效");
     }
 
+    void testBatchExportKeepsExistingFiles()
+    {
+        QTemporaryDir directory;
+        require(directory.isValid(), "无法建立批量导出目录");
+        const QString first = directory.filePath("frame.png");
+        const QString second = directory.filePath("frame_undistorted.png");
+        const QString previous = directory.filePath("frame_undistorted_2.png");
+        QImage image(320, 240, QImage::Format_RGB32);
+        image.fill(Qt::red);
+        require(image.save(first), "无法保存第一张批量输入");
+        image.fill(Qt::blue);
+        require(image.save(second), "无法保存与输出同名的输入");
+        image.fill(Qt::green);
+        require(image.save(previous), "无法保存已有导出结果");
+
+        MainWindow window;
+        window.loadImages({first, second});
+        QEventLoop wait;
+        QTimer driver;
+        QString summary;
+        QObject::connect(&driver, &QTimer::timeout, &window, [&]
+        {
+            for (QWidget *widget: QApplication::topLevelWidgets())
+            {
+                if (!widget->isVisible()) continue;
+                if (auto *dialog = qobject_cast<QFileDialog *>(widget))
+                {
+                    child<QLineEdit>(*dialog, "fileNameEdit")->setText(directory.path());
+                    QMetaObject::invokeMethod(dialog, "accept", Qt::QueuedConnection);
+                }
+                else if (auto *message = qobject_cast<QMessageBox *>(widget))
+                {
+                    if (message->windowTitle() == QStringLiteral("批量导出去畸变图片"))
+                    {
+                        summary = message->text();
+                        wait.quit();
+                    }
+                    message->accept();
+                }
+            }
+        });
+        driver.start(10);
+        const auto result = successfulResult(0.2, 500.0);
+        require(QMetaObject::invokeMethod(&window, "onApplyComparisonResult",
+            Qt::DirectConnection, Q_ARG(CalibrationResult, result)), "无法应用批量导出参数");
+        child<QAction>(window, "batchExportAction")->trigger();
+        if (summary.isEmpty()) wait.exec();
+        driver.stop();
+
+        require(summary.contains("已导出 2 张，跳过 0 张") && !summary.contains("取消"),
+            "批量任务应正确报告完成状态");
+        require(QImage(second).pixelColor(160, 120) == QColor(Qt::blue)
+                && QImage(previous).pixelColor(160, 120) == QColor(Qt::green),
+            "批量导出覆盖了输入或已有输出");
+        require(QImage(directory.filePath("frame_undistorted_3.png")).pixelColor(160, 120) == QColor(Qt::red)
+                && QImage(directory.filePath("frame_undistorted_undistorted.png")).pixelColor(160, 120) == QColor(Qt::blue),
+            "导出文件未分别对应两张输入图");
+    }
+
     void testFailureReasons()
     {
         QTemporaryDir directory;
@@ -450,8 +666,11 @@ int main(int argc, char **argv)
     try
     {
         testComparisonApplication();
+        testDropImagesAndFolders();
         testImageParticipationAndFilters();
+        testImportParameters();
         testSessionRestoration();
+        testBatchExportKeepsExistingFiles();
         testFailureReasons();
         qInfo("界面功能测试通过");
         return EXIT_SUCCESS;

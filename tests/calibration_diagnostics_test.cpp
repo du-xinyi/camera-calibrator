@@ -1,7 +1,9 @@
 #include "calibration.h"
+#include "calibration_project.h"
 
 #include <QCoreApplication>
 #include <QDebug>
+#include <QDir>
 #include <QFile>
 #include <QImage>
 #include <QTemporaryDir>
@@ -26,6 +28,13 @@ namespace
         {
             throw std::runtime_error(message);
         }
+    }
+
+    void writeFile(const QString &path, const QByteArray &contents)
+    {
+        QFile output(path);
+        require(output.open(QIODevice::WriteOnly), "参数测试写入失败");
+        require(output.write(contents) == contents.size(), "参数测试写入不完整");
     }
 
     QImage imageCopy(const cv::Mat &image)
@@ -334,16 +343,24 @@ namespace
             && !found && report.status == ImageDetectionStatus::InsufficientCorners,
             "角点不足预览必须返回具体原因");
 
-        // 普通棋盘 1×1 内角点不满足 OpenCV 检测器条件，单图异常不能中止整个批次。
-        options.boardSize = {2, 2};
-        const auto processingFailure = calibrator.calibrate({blankPath, blankPath}, options);
-        require(processingFailure.imageReports.size() == 2
-            && processingFailure.imageReports[0].status == ImageDetectionStatus::ProcessingFailed
-            && processingFailure.imageReports[1].status == ImageDetectionStatus::ProcessingFailed,
-            "逐图处理异常必须记录后继续处理下一张图片");
-        require(calibrator.previewImage(blankPath, options, noResult, false, &found, &report).isNull()
-            && report.status == ImageDetectionStatus::ProcessingFailed && !report.message.isEmpty(),
-            "预览处理异常必须返回具体原因");
+        // 普通棋盘的每个方向都至少需要 3 个内部角点。
+        for (const QSize boardSize: {QSize(3, 4), QSize(4, 3)})
+        {
+            options.boardSize = boardSize;
+            const auto invalidOptions = calibrator.calibrate({blankPath}, options);
+            require(!invalidOptions.success && invalidOptions.imageReports.empty()
+                && invalidOptions.report.contains(QStringLiteral("4 个方格")),
+                "普通棋盘尺寸过小应在逐图检测前报告配置错误");
+            require(!calibrator.previewImage(blankPath, options, noResult, false, &found, &report).isNull()
+                && !found && report.status == ImageDetectionStatus::ProcessingFailed
+                && report.message == invalidOptions.report,
+                "预览应保留原图并报告相同的棋盘尺寸错误");
+        }
+        options.boardSize = {4, 4};
+        const auto validSize = calibrator.calibrate({blankPath}, options);
+        require(validSize.imageReports.size() == 1
+            && validSize.imageReports[0].status == ImageDetectionStatus::BoardNotFound,
+            "普通棋盘达到 4×4 方格时应进入检测流程");
     }
 
     void testParameterFormat(const QString &directory)
@@ -356,6 +373,12 @@ namespace
             {
                 CalibrationResult parameters = previewParameters(model);
                 parameters.options.boardType = board;
+                parameters.rmsError = 0.625;
+                parameters.imagesUsed = 1;
+                parameters.imagesTotal = 2;
+                const CalibrationPose pose{directory + "/board.png",
+                    {0.125, 0.25, 0.375}, {10.0, -20.0, 500.0}, 0.75};
+                parameters.poses.push_back(pose);
                 const QString path = directory + QString("/parameters_%1_%2.yaml")
                     .arg(static_cast<int>(model)).arg(static_cast<int>(board));
                 require(calibrator.exportParameters(path, parameters, &error), "当前参数导出失败");
@@ -364,10 +387,18 @@ namespace
                     && imported->options.boardType == board
                     && imported->options.boardSize == parameters.options.boardSize
                     && imported->options.radialCoeffs == parameters.options.radialCoeffs
+                    && imported->hasMetadata(QStringLiteral("rms_reprojection_error"))
+                    && imported->rmsError == 0.625 && imported->imagesUsed == 1
+                    && imported->imagesTotal == 2
                     && imported->distCoeffs.rows == 1
                     && cv::norm(imported->cameraMatrix, parameters.cameraMatrix, cv::NORM_INF) == 0.0
                     && cv::norm(imported->distCoeffs, parameters.distCoeffs.reshape(1, 1), cv::NORM_INF) == 0.0,
                     "两种相机和标定板的当前 YAML 必须正确往返");
+                require(imported->poses.size() == 1 && imported->poses[0].imagePath == pose.imagePath
+                    && imported->poses[0].rotationVector == pose.rotationVector
+                    && imported->poses[0].translationVector == pose.translationVector
+                    && imported->poses[0].reprojectionError == pose.reprojectionError,
+                    "完整参数导入必须恢复逐图位姿");
             }
         }
 
@@ -379,22 +410,152 @@ namespace
         const QByteArray baseline = input.readAll();
         input.close();
         const auto reject = [&](QByteArray contents, const char *message) {
-            QFile output(path);
-            require(output.open(QIODevice::WriteOnly | QIODevice::Truncate), "参数测试写入失败");
-            require(output.write(contents) == contents.size(), "参数测试写入不完整");
-            output.close();
+            writeFile(path, contents);
             require(!calibrator.importParameters(path, &error) && !error.isEmpty(), message);
         };
         reject(QByteArray(baseline).replace("format_version: 3", "format_version: 2"),
             "不应再读取旧版本参数");
         reject(QByteArray(baseline).replace("camera_model: pinhole\n", ""),
             "缺少模型不应默认采用 Pinhole");
-        reject(QByteArray(baseline).replace("board_columns:", "missing_board_columns:"),
-            "缺少元信息不应回退到默认板尺寸");
         reject(QByteArray(baseline).replace("camera_model: pinhole", "camera_model: unknown"),
             "未知模型必须拒绝");
         reject(QByteArray(baseline).replace("radial_coefficients: 3", "radial_coefficients: 8"),
             "不匹配的径向系数数量必须拒绝");
+    }
+
+    void testMinimalParameterImport(const QString &directory)
+    {
+        const QByteArray minimal =
+            "camera_model: pinhole\n"
+            "image_width: 160\n"
+            "image_height: 120\n"
+            "camera_matrix: [[130.0, 0.0, 80.0], [0.0, 131.0, 60.0], [0.0, 0.0, 1.0]]\n"
+            "distortion_coefficients: [-0.25, 0.0, 0.0, 0.0, 0.0]\n";
+        const QByteArray poses =
+            "poses:\n"
+            "  - image: cam1/board.png\n"
+            "    rotation_vector: [0.125, 0.25, 0.375]\n"
+            "    translation_vector: [10.0, -20.0, 500.0]\n"
+            "    reprojection_error: 0.75\n"
+            "  - image: cam2/board.png\n"
+            "    rotation_vector: [0.125, 0.25, 0.375]\n"
+            "    translation_vector: [10.0, -20.0, 600.0]\n"
+            "    reprojection_error: 0.5\n";
+        const QString yamlPath = directory + "/minimal.yaml";
+        const Calibrator calibrator;
+        QString error;
+        writeFile(yamlPath, minimal);
+        const auto minimalResult = calibrator.importParameters(yamlPath, &error);
+        require(minimalResult && minimalResult->success && error.isEmpty()
+            && minimalResult->imageSize == QSize(160, 120)
+            && !minimalResult->hasMetadata(QStringLiteral("rms_reprojection_error"))
+            && !minimalResult->hasMetadata(QStringLiteral("images_used"))
+            && !minimalResult->hasMetadata(QStringLiteral("quality_warning"))
+            && minimalResult->poses.empty(), "精简 YAML 应能导入并区分缺失统计");
+
+        const auto preview = calibrator.undistortionPreview(directory + "/preview.png",
+            *minimalResult);
+        require(preview.error.isEmpty() && !preview.undistorted.isNull()
+            && preview.original != preview.undistorted, "精简参数应能用于实际去畸变");
+
+        writeFile(yamlPath, minimal + "board_columns: 9\nimages_total: 8\n" + poses);
+        const auto partial = calibrator.importParameters(yamlPath, &error);
+        require(partial && partial->options.boardSize.width() == 9
+            && partial->hasMetadata(QStringLiteral("board_columns"))
+            && !partial->hasMetadata(QStringLiteral("board_rows"))
+            && partial->hasMetadata(QStringLiteral("images_total")) && partial->imagesTotal == 8
+            && !partial->hasMetadata(QStringLiteral("images_used"))
+            && partial->poses.size() == 2, "可选元信息应能独立提供");
+
+        CalibrationProject project;
+        project.options = partial->options;
+        project.result = partial;
+        project.resultImported = true;
+        const QString projectPath = directory + "/minimal.calibration.json";
+        require(CalibrationProjectIo::save(projectPath, project, &error),
+            "带有位姿和缺失统计的项目应能保存");
+        const auto reopened = CalibrationProjectIo::load(projectPath, &error);
+        require(reopened && reopened->result && reopened->resultImported
+            && !reopened->result->hasMetadata(QStringLiteral("rms_reprojection_error"))
+            && !reopened->result->hasMetadata(QStringLiteral("images_used"))
+            && reopened->result->poses.size() == 2, "重开项目应保留缺失统计和位姿");
+        require(QDir(directory).mkdir("exports"), "无法建立参数导出测试目录");
+        const QString exported = directory + "/exports/minimal_exported.yaml";
+        require(calibrator.exportParameters(exported, *reopened->result, &error),
+            "重开的精简参数应能再次导出");
+        const auto roundTrip = calibrator.importParameters(exported, &error);
+        require(roundTrip && !roundTrip->hasMetadata(QStringLiteral("rms_reprojection_error"))
+            && !roundTrip->hasMetadata(QStringLiteral("images_used"))
+            && roundTrip->hasMetadata(QStringLiteral("images_total")) && roundTrip->imagesTotal == 8
+            && !roundTrip->hasMetadata(QStringLiteral("board_rows"))
+            && roundTrip->poses.size() == 2 && roundTrip->poses[0].reprojectionError == 0.75
+            && roundTrip->poses[0].imagePath == directory + "/cam1/board.png"
+            && roundTrip->poses[1].imagePath == directory + "/cam2/board.png",
+            "再次导出应保留位姿和已提供字段，同时省略缺失字段");
+
+        const auto reject = [&](const QByteArray &contents, const char *message) {
+            writeFile(yamlPath, contents);
+            require(!calibrator.importParameters(yamlPath, &error) && !error.isEmpty(), message);
+        };
+        reject(QByteArray(minimal).replace("image_height: 120\n", ""), "分辨率必须提供");
+        reject(QByteArray(minimal).replace("130.0", "-130.0"), "负焦距必须拒绝");
+        reject(QByteArray(minimal).replace("-0.25, ", ""), "畸变系数数量错误必须拒绝");
+        reject(minimal + "rms_reprojection_error: -0.25\n", "已提供的 RMS 必须校验");
+        reject(minimal + QByteArray(poses).replace("[0.125, 0.25, 0.375]", "[0.125, 0.25]"),
+            "位姿向量必须有三个分量");
+    }
+
+    void testStandardYamlLayouts(const QString &directory)
+    {
+        const QByteArray block =
+            "camera_matrix:\n"
+            "- - 130\n"
+            "  - 0\n"
+            "  - 80\n"
+            "- - 0\n"
+            "  - 131\n"
+            "  - 60\n"
+            "- - 0\n"
+            "  - 0\n"
+            "  - 1\n"
+            "camera_model: pinhole\n"
+            "distortion_coefficients:\n"
+            "- -0.25\n"
+            "- 0\n"
+            "- 0\n"
+            "- 0\n"
+            "- 0\n"
+            "image_height: 120\n"
+            "image_width: 160\n"
+            "poses:\n"
+            "- image: 001.png\n"
+            "  rotation_vector: [0.125, 0.25, 0.375]\n"
+            "  translation_vector: [10, -20, 500]\n"
+            "  reprojection_error: 0.75\n";
+        const QByteArray flow =
+            "{camera_matrix: [[130, 0, 80], [0, 131, 60], [0, 0, 1]], camera_model: pinhole,\n"
+            "distortion_coefficients: !!opencv-matrix {rows: 1, cols: 5, dt: d, data: [-0.25, 0, 0, 0, 0]},\n"
+            "image_height: 120, image_width: 160}\n";
+        const QString path = directory + "/standard.yaml";
+        const Calibrator calibrator;
+        QString error;
+        writeFile(path, block);
+        const auto blockResult = calibrator.importParameters(path, &error);
+        require(blockResult && blockResult->poses.size() == 1
+            && blockResult->poses[0].imagePath == directory + "/001.png",
+            "PyYAML 默认块序列及数字开头的图片名必须保留");
+
+        writeFile(path, flow);
+        const auto flowResult = calibrator.importParameters(path, &error);
+        require(flowResult && flowResult->imageSize == QSize(160, 120)
+            && cv::norm(flowResult->cameraMatrix, blockResult->cameraMatrix) == 0.0
+            && cv::norm(flowResult->distCoeffs, blockResult->distCoeffs) == 0.0
+            && flowResult->distCoeffs.at<double>(0, 0) == -0.25,
+            "顶层流式 YAML 必须正确读取 OpenCV 标记矩阵");
+
+        writeFile(path, QByteArray(block).replace("image_width: 160", "image_width: '160'"));
+        require(!calibrator.importParameters(path, &error) && !error.isEmpty(),
+            "标准 YAML 中带引号的数字不能作为图像尺寸");
     }
 
 }
@@ -412,6 +573,8 @@ int main(int argc, char *argv[])
     {
         testUndistortionPreview(directory.path());
         testParameterFormat(directory.path());
+        testMinimalParameterImport(directory.path());
+        testStandardYamlLayouts(directory.path());
         testDetectionFailures(directory.path());
         testCalibrationDiagnostics(directory.path(), CameraModel::Pinhole);
         testCalibrationDiagnostics(directory.path(), CameraModel::Fisheye);

@@ -1,4 +1,5 @@
 #include "image_quality.h"
+#include "image_io.h"
 
 #include <QObject>
 
@@ -10,7 +11,7 @@
 ImageQualityResult analyzeImageQuality(const QString &filePath)
 {
     ImageQualityResult result;
-    cv::Mat image = cv::imread(filePath.toStdString(), cv::IMREAD_GRAYSCALE);
+    cv::Mat image = readOrientedImage(filePath, cv::IMREAD_GRAYSCALE);
     if (image.empty())
     {
         result.warnings << QObject::tr("无法读取");

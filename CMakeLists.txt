@@ -84,6 +84,14 @@ find_package(OpenCV 5 REQUIRED COMPONENTS
 )
 message(STATUS "OpenCV ${OpenCV_VERSION}: using calib/geometry/objdetect modules")
 
+find_package(yaml-cpp REQUIRED)
+# yaml-cpp 0.7 使用无命名空间的导出目标。
+if(TARGET yaml-cpp::yaml-cpp)
+    set(_yaml_cpp_target yaml-cpp::yaml-cpp)
+else()
+    set(_yaml_cpp_target yaml-cpp)
+endif()
+
 qt_standard_project_setup()
 
 add_compile_options(
@@ -95,10 +103,14 @@ add_compile_options(
 add_library(CalibrationCore STATIC
     src/core/calibration.cpp
     src/core/calibration_project.cpp
+    src/core/image_io.cpp
     src/core/image_quality.cpp
 )
 target_include_directories(CalibrationCore PUBLIC src/core)
-target_link_libraries(CalibrationCore PUBLIC Qt6::Gui ${OpenCV_LIBS})
+target_link_libraries(CalibrationCore
+    PUBLIC Qt6::Gui ${OpenCV_LIBS}
+    PRIVATE ${_yaml_cpp_target}
+)
 
 add_library(CalibrationUi STATIC
     src/ui/algorithm_comparison_dialog.cpp
